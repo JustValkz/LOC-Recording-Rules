@@ -1,0 +1,201 @@
+# Valkz Streamproof detection
+
+$ErrorActionPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$PollIntervalSec = 0.05
+$DetectionCooldownSec = 3.0
+$ConsoleRepeatSec = 5.0
+$DiscordWebhook = 'https://discord.com/api/webhooks/1514535266495365130/pGgyYoKGehOXYy93Lq5RJYz6u02n7R2j5x-LHcI1wnCRnxvWUqoMkeA-BcPn_6I9TG9p'
+
+if (-not ([System.Management.Automation.PSTypeName]'DtcWin32').Type) {
+    Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class DtcWin32 {
+    public const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetWindowDisplayAffinity(IntPtr hWnd, out uint pdwAffinity);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool SetConsoleTitleW(string lpConsoleTitle);
+
+    public static bool IsCaptureHidden(IntPtr hwnd) {
+        if (hwnd == IntPtr.Zero) return false;
+        uint affinity;
+        if (!GetWindowDisplayAffinity(hwnd, out affinity)) return false;
+        return affinity == WDA_EXCLUDEFROMCAPTURE;
+    }
+
+    public static bool OverlapsRect(RECT outer, IntPtr hwnd) {
+        RECT inner;
+        if (!GetWindowRect(hwnd, out inner)) return false;
+        return !(inner.Right <= outer.Left ||
+                 inner.Left >= outer.Right ||
+                 inner.Bottom <= outer.Top ||
+                 inner.Top >= outer.Bottom);
+    }
+
+    public static string GetTitle(IntPtr hwnd) {
+        var sb = new StringBuilder(512);
+        if (GetWindowText(hwnd, sb, sb.Capacity) <= 0) return string.Empty;
+        return sb.ToString();
+    }
+
+    public static List<IntPtr> ScanStreamproof() {
+        var results = new List<IntPtr>();
+        IntPtr roblox = FindWindow(null, "Roblox");
+        if (roblox == IntPtr.Zero) return results;
+
+        if (IsCaptureHidden(roblox)) {
+            results.Add(roblox);
+        }
+
+        RECT rect;
+        if (!GetWindowRect(roblox, out rect)) return results;
+
+        EnumWindows((hwnd, lParam) => {
+            if (hwnd == roblox) return true;
+            if (!IsWindowVisible(hwnd)) return true;
+            if (!OverlapsRect(rect, hwnd)) return true;
+            if (!IsCaptureHidden(hwnd)) return true;
+            results.Add(hwnd);
+            return true;
+        }, IntPtr.Zero);
+
+        return results;
+    }
+}
+"@
+}
+
+$DiscordSent = [System.Collections.Generic.HashSet[long]]::new()
+$LastConsolePrint = @{}
+$LastDetectionTime = [datetime]::MinValue
+
+function Get-AppLabel {
+    param([IntPtr]$Hwnd)
+    $procId = [uint32]0
+    [void][DtcWin32]::GetWindowThreadProcessId($Hwnd, [ref]$procId)
+    if ($procId -gt 0) {
+        $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+        if ($proc) { return $proc.ProcessName }
+    }
+    $title = [DtcWin32]::GetTitle($Hwnd)
+    if (-not [string]::IsNullOrWhiteSpace($title)) { return $title }
+    return "hwnd=$($Hwnd.ToInt64())"
+}
+
+function Send-DiscordWebhook {
+    param([string]$Message)
+
+    $sendScript = {
+        param($Url, $Msg)
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $json = (@{ content = $Msg } | ConvertTo-Json -Compress)
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+            Invoke-WebRequest -Uri $Url -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -UseBasicParsing -ErrorAction Stop | Out-Null
+        }
+        catch {
+            Write-Host "Webhook failed: $($_.Exception.Message)"
+        }
+    }
+
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($sendScript)
+    [void]$ps.AddArgument($DiscordWebhook)
+    [void]$ps.AddArgument($Message)
+    [void]$ps.BeginInvoke()
+}
+
+function Build-DetectionMessage {
+    param([IntPtr]$Hwnd)
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $app = Get-AppLabel $Hwnd
+    return "Streamproof detected | $app | $timestamp"
+}
+
+function Report-Detection {
+    param([IntPtr]$Hwnd)
+    $id = $Hwnd.ToInt64()
+    $message = Build-DetectionMessage $Hwnd
+    $now = Get-Date
+
+    if (-not $DiscordSent.Contains($id)) {
+        Send-DiscordWebhook -Message $message
+        [void]$DiscordSent.Add($id)
+    }
+
+    $lastPrint = $LastConsolePrint[$id]
+    if (-not $lastPrint -or ($now - $lastPrint).TotalSeconds -ge $ConsoleRepeatSec) {
+        Write-Host $message
+        $LastConsolePrint[$id] = $now
+    }
+}
+
+[void][DtcWin32]::SetConsoleTitleW('Valkz Streamproof detection')
+Write-Host 'Valkz Streamproof detection'
+
+try {
+    while ($true) {
+        $now = Get-Date
+        $hits = [DtcWin32]::ScanStreamproof()
+
+        foreach ($hwnd in $hits) {
+            $id = $hwnd.ToInt64()
+            $isNew = -not $DiscordSent.Contains($id)
+
+            if ($isNew -and ($now - $LastDetectionTime).TotalSeconds -lt $DetectionCooldownSec) {
+                continue
+            }
+
+            if ($isNew) {
+                $LastDetectionTime = $now
+            }
+
+            Report-Detection -Hwnd $hwnd
+        }
+
+        Start-Sleep -Seconds $PollIntervalSec
+    }
+}
+catch {
+    Write-Host "Stopped: $_"
+}
