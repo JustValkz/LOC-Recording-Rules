@@ -440,7 +440,7 @@ function Invoke-LocRecMonitorMode {
     Write-Host " / /__/ /_/ / /__  / , _/ _// /__/ /_/ / , _/ // // //    / (_ / / ___/ /_/ / /___/ // /__   \  /   / /  / / " -ForegroundColor Cyan
     Write-Host "/____/\____/\___/ /_/|_/___/\___/\____/_/|_/____/___/_/|_/\___/ /_/   \____/____/___/\___/   /_/   /_/  /_/  " -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Made by Valkz + Reggie | Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
+    Write-Host "Made by Valkz + Mort | Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
     Write-Host ""
 
 $eventList = [System.Collections.Generic.List[string]]::new()
