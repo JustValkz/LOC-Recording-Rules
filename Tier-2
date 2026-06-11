@@ -340,295 +340,44 @@ function Test-StartsWithAnyPath {
 
 function Get-EmbeddedBamToolScript {
     return @'
-# ===============================
-# BAM REVIEW
-# ===============================
-
+# BAM REVIEW (lite)
 $ErrorActionPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Data
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$script:BamRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings'
-$script:SignatureCache = @{}
+$BamRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings'
+$MaxRows = 120
+$Cutoff = (Get-Date).AddDays(-3)
 
-function Get-KeywordList {
-    return @(
-    'matcha'
-    'evolve'
-    'mooze'
-    'isabelle'
-    'matrix'
-    'tsar'
-    'melatonin'
-    'serotonin'
-    'aimmy'
-    'aimbot'
-    'triggerbot'
-    'silentaim'
-    'colorbot'
-    'valex'
-    'vector'
-    'photon'
-    'nezur'
-    'yebra'
-    'haze/myst'
-    'haze'
-    'myst'
-    'horizon'
-    'havoc'
-    'xeno'
-    'solara'
-    'olduimatrix'
-    'monkeyaim'
-    'thunderaim'
-    'thunderclient'
-    'celex'
-    'zarora'
-    'juju'
-    'nezure'
-    'fluxus'
-    'clumsy'
-    'dx9ware'
-    'fusionhacks'
-    'bootstrappernew'
-    'santoware'
-    'xenoui'
-    'mapper'
-    'map'
-    'boostrapper'
-    'boostrappernew'
-    'bootstrapper'
-    'authenticator'
-    'thing'
-    'app\.exe'
-    'update\.exe'
-    'updater\.exe'
-    'upgrade'
-    'threat-'
-    'cleaner'
-    'upgrader'
-    'aura'
-    'loader'
-    'mainrunner'
-    'usermode'
-    'newui'
-    'oldui'
-    'bypass'
-    'injector'
-    'executor'
-    'external'
-    'internal'
-    'spoof'
-    'spoofer'
-    'macro'
-    'ahk'
-    'autohotkey'
-    'keyauth'
-    'dll'
-    'manualmap'
-    'driver'
-    'kdmapper'
-    'kdmapper\.exe'
-    'cheat'
-    'cheats'
-    'hack'
-    'hacks'
-    'inject'
-    'injection'
-    'overlay'
-    'esp'
-    'wallhack'
-    'silent'
-    'trigger'
-    'aim'
-    'universal'
-    'crack'
+$Keywords = @(
+'matcha','evolve','mooze','matrix','aimmy','aimbot','triggerbot','silentaim','valex','vector','photon','nezur',
+'haze','myst','horizon','havoc','xeno','solara','fluxus','clumsy','dx9ware','mapper','bootstrapper','loader',
+'bypass','injector','executor','spoof','spoofer','keyauth','kdmapper','cheat','hack','inject','overlay','esp',
+'aim','crack','dll','driver','macro','ahk','internal','external','updater','cleaner','aura','serotonin','melatonin'
 )
+$KwRe = [regex]::new('(?i)(' + (($Keywords | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')')
+
+function Short([string]$t, [int]$n = 36) {
+    if ([string]::IsNullOrEmpty($t)) { return '' }
+    if ($t.Length -le $n) { return $t }
+    return $t.Substring(0, $n - 3) + '...'
 }
 
-$script:Keywords = @(Get-KeywordList)
-
-function New-UIFont {
-    param([float]$Size,[switch]$Bold)
-    $style = [System.Drawing.FontStyle]::Regular
-    if ($Bold) { $style = [System.Drawing.FontStyle]::Bold }
-    return New-Object System.Drawing.Font -ArgumentList 'Segoe UI', $Size, $style
-}
-
-function Enable-DoubleBuffer {
-    param([System.Windows.Forms.Control]$Control)
-    try {
-        $prop = $Control.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
-        if ($prop) { $prop.SetValue($Control, $true, $null) }
-    } catch {}
-}
-
-function Get-FormSize {
-    try {
-        $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-        $w = [Math]::Max(980, [int]($area.Width * 0.94))
-        $h = [Math]::Max(620, [int]($area.Height * 0.90))
-        return New-Object System.Drawing.Size($w, $h)
-    } catch {
-        return New-Object System.Drawing.Size(1250, 760)
-    }
-}
-
-function Format-RelativeTime {
-    param([datetime]$Time)
-    $span = (Get-Date) - $Time
-    if ($span.TotalSeconds -lt 10) { return 'Just now' }
-    if ($span.TotalSeconds -lt 60) { return "$([int]$span.TotalSeconds) seconds ago" }
-    if ($span.TotalMinutes -lt 60) {
-        $m = [int]$span.TotalMinutes
-        if ($m -eq 1) { return '1 minute ago' }
-        return "$m minutes ago"
-    }
-    if ($span.TotalHours -lt 24) {
-        $h = [int]$span.TotalHours
-        if ($h -eq 1) { return '1 hour ago' }
-        return "$h hours ago"
-    }
-    $d = [int]$span.TotalDays
-    if ($d -eq 1) { return '1 day ago' }
-    return "$d days ago"
-}
-
-function Wrap-LongText {
-    param([string]$Text,[int]$Limit = 54)
-    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
-    $text = [string]$Text
-    if ($text.Length -le $Limit) { return $text }
-
-    if ($text -like '*\*') {
-        $lines = New-Object System.Collections.Generic.List[string]
-        $current = ''
-        $parts = $text -split '\\'
-        foreach ($part in $parts) {
-            if ($current.Length -eq 0) {
-                $next = $part
-            } else {
-                $next = "$current\$part"
-            }
-            if ($next.Length -gt $Limit -and $current.Length -gt 0) {
-                [void]$lines.Add($current + '\')
-                $current = $part
-            } else {
-                $current = $next
-            }
-        }
-        if ($current.Length -gt 0) { [void]$lines.Add($current) }
-        return ($lines -join "`r`n")
-    }
-
-    $chunks = New-Object System.Collections.Generic.List[string]
-    $start = 0
-    while ($start -lt $text.Length) {
-        $take = [Math]::Min($Limit, $text.Length - $start)
-        [void]$chunks.Add($text.Substring($start, $take))
-        $start += $take
-    }
-    return ($chunks -join "`r`n")
-}
-
-function Test-KeywordHit {
-    param([string]$Text)
-    foreach ($keyword in $script:Keywords) {
-        try {
-            if ($Text -match "(?i)$keyword") { return $keyword }
-        } catch {}
-    }
-    return ''
-}
-
-function Resolve-BamPath {
-    param([string]$RawPath)
-    if ([string]::IsNullOrWhiteSpace($RawPath)) { return '' }
-
-    $path = [string]$RawPath
-    if ($path.StartsWith('\??\')) { return $path.Substring(4) }
-    if ($path -match '^[A-Za-z]:\\') { return $path }
-
-    if ($path -match '^\\Device\\HarddiskVolume\d+\\(.+)$') {
-        $tail = $matches[1]
-        foreach ($drive in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | Where-Object { $_.Root -match '^[A-Za-z]:\\$' })) {
-            try {
-                $candidate = Join-Path $drive.Root $tail
-                if (Test-Path -LiteralPath $candidate) { return $candidate }
-            } catch {}
-        }
-        if ($env:SystemDrive) { return (Join-Path ($env:SystemDrive + '\') $tail) }
-    }
-
-    return $path
-}
-
-function Get-SignatureState {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return 'N/A' }
-    if ($script:SignatureCache.ContainsKey($Path)) { return $script:SignatureCache[$Path] }
-
-    $state = 'N/A'
-    try {
-        if (Test-Path -LiteralPath $Path) {
-            $sig = Get-AuthenticodeSignature -LiteralPath $Path
-            if ($sig.Status -eq 'Valid') {
-                $state = 'Valid'
-            } elseif ($sig.Status -eq 'NotSigned' -or $sig.Status -eq 'UnknownError') {
-                $state = 'N/A'
-            } else {
-                $state = 'Invalid'
-            }
-        }
-    } catch {
-        $state = 'N/A'
-    }
-
-    $script:SignatureCache[$Path] = $state
-    return $state
-}
-
-function Get-SortGroup {
-    param([string]$KeywordHit,[string]$Signature)
-    if ($KeywordHit) { return 0 }
-    if ($Signature -eq 'Invalid') { return 1 }
-    if ($Signature -eq 'N/A') { return 2 }
-    if ($Signature -eq 'Valid') { return 3 }
-    return 4
-}
-
-function New-Table {
-    $table = New-Object System.Data.DataTable
-    foreach ($name in @('RelativeTime','LastRun','Application','Path','Signature','KeywordHit','UserSID')) {
-        [void]$table.Columns.Add($name)
-    }
-    return ,$table
-}
-
-function Add-TableRow {
-    param([System.Data.DataTable]$Table,[object]$Entry)
-    $row = $Table.NewRow()
-    $row['RelativeTime'] = $Entry.RelativeTime
-    $row['LastRun'] = $Entry.LastRun
-    $row['Application'] = $Entry.Application
-    $row['Path'] = $Entry.Path
-    $row['Signature'] = $Entry.Signature
-    $row['KeywordHit'] = $Entry.KeywordHit
-    $row['UserSID'] = $Entry.UserSID
-    [void]$Table.Rows.Add($row)
+function CleanPath([string]$p) {
+    if ([string]::IsNullOrEmpty($p)) { return '' }
+    if ($p.StartsWith('\??\')) { return $p.Substring(4) }
+    return $p
 }
 
 function Get-BamRows {
-    $rows = New-Object System.Collections.Generic.List[object]
-    if (-not (Test-Path -LiteralPath $script:BamRoot)) { return $rows }
+    $hits = New-Object System.Collections.Generic.List[string]
+    $recent = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $BamRoot)) { return @() }
 
-    $sidKeys = @(Get-ChildItem -LiteralPath $script:BamRoot -ErrorAction SilentlyContinue)
-    foreach ($sidKey in $sidKeys) {
+    foreach ($sidKey in (Get-ChildItem -LiteralPath $BamRoot -ErrorAction SilentlyContinue)) {
         $sid = $sidKey.PSChildName
-        $keyPath = Join-Path $script:BamRoot $sid
-        $props = Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        $props = Get-ItemProperty -LiteralPath (Join-Path $BamRoot $sid) -ErrorAction SilentlyContinue
         if (-not $props) { continue }
 
         foreach ($prop in $props.PSObject.Properties) {
@@ -637,219 +386,111 @@ function Get-BamRows {
             if (-not $raw -or $raw.Length -lt 8) { continue }
 
             try {
-                $fileTime = [BitConverter]::ToInt64($raw[0..7], 0)
-                if ($fileTime -le 0) { continue }
+                $tick = [BitConverter]::ToInt64($raw[0..7], 0)
+                if ($tick -le 0) { continue }
+                $time = [DateTime]::FromFileTimeUtc($tick).ToLocalTime()
+                if ($time -lt $Cutoff) { continue }
 
-                $time = [DateTime]::FromFileTimeUtc($fileTime).ToLocalTime()
-                $path = Resolve-BamPath $prop.Name
+                $rawName = [string]$prop.Name
+                $m = $KwRe.Match($rawName)
+                $path = CleanPath $rawName
                 $app = Split-Path $path -Leaf
-                if ([string]::IsNullOrWhiteSpace($app)) { $app = Split-Path $prop.Name -Leaf }
-                if ([string]::IsNullOrWhiteSpace($app)) { $app = $prop.Name }
+                if ([string]::IsNullOrWhiteSpace($app)) { $app = $rawName }
+                $line = $time.ToString('MM/dd HH:mm') + '|' + (Short $app) + '|' + (Short $path 52) + '|' + (Short $sid 28)
 
-                $hit = Test-KeywordHit "$app $path $($prop.Name)"
-                $sig = Get-SignatureState $path
-
-                $rows.Add([PSCustomObject]@{
-                    SortGroup = Get-SortGroup $hit $sig
-                    Tick = $fileTime
-                    RelativeTime = Format-RelativeTime $time
-                    LastRun = $time.ToString('yyyy-MM-dd HH:mm:ss')
-                    Application = Wrap-LongText $app 42
-                    Path = Wrap-LongText $path 58
-                    Signature = $sig
-                    KeywordHit = $hit
-                    UserSID = Wrap-LongText $sid 38
-                })
+                if ($m.Success) {
+                    $line += '|' + $m.Groups[1].Value
+                    [void]$hits.Add($tick.ToString('D19') + '|' + $line)
+                } else {
+                    [void]$recent.Add([PSCustomObject]@{ Tick = $tick; Line = $line })
+                }
             } catch {}
         }
     }
 
-    return @($rows | Sort-Object SortGroup, @{Expression='Tick';Descending=$true}, Application)
-}
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($h in ($hits | Sort-Object)) { [void]$out.Add(($h -split '\|', 2)[1]) }
 
-function Build-BamTable {
-    $table = New-Table
-    foreach ($entry in (Get-BamRows)) { Add-TableRow $table $entry }
-    return ,$table
-}
+    $slots = [Math]::Max(0, $MaxRows - $out.Count)
+    if ($slots -gt 0) {
+        foreach ($r in ($recent | Sort-Object Tick -Descending | Select-Object -First $slots)) {
+            [void]$out.Add($r.Line)
+        }
+    }
 
-$table = Build-BamTable
+    return $out.ToArray()
+}
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'BAM Review'
-$form.StartPosition = 'CenterScreen'
 $form.WindowState = 'Maximized'
-$form.Size = Get-FormSize
-$form.MinimumSize = New-Object System.Drawing.Size(940,600)
-$form.BackColor = [System.Drawing.Color]::FromArgb(18,18,18)
+$form.BackColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
 $form.ForeColor = [System.Drawing.Color]::Gainsboro
-$form.Font = New-UIFont 9
-Enable-DoubleBuffer $form
+$form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
-$topPanel = New-Object System.Windows.Forms.Panel
-$topPanel.Dock = 'Top'
-$topPanel.Height = 52
-$topPanel.BackColor = [System.Drawing.Color]::FromArgb(24,24,24)
-$topPanel.Padding = New-Object System.Windows.Forms.Padding(10,7,10,7)
+$head = New-Object System.Windows.Forms.Label
+$head.Dock = 'Top'
+$head.Height = 34
+$head.Text = 'BAM Lite | 120 rows | last 3 days | hits on top'
+$head.TextAlign = 'MiddleLeft'
+$head.Padding = New-Object System.Windows.Forms.Padding(10, 0, 0, 0)
+$head.BackColor = [System.Drawing.Color]::FromArgb(28, 28, 28)
+$head.ForeColor = [System.Drawing.Color]::Gainsboro
 
-$titleLabel = New-Object System.Windows.Forms.Label
-$titleLabel.Text = 'BAM Review  |  Keywords loaded locally: ' + $script:Keywords.Count
-$titleLabel.Font = New-UIFont 10 -Bold
-$titleLabel.ForeColor = [System.Drawing.Color]::Gainsboro
-$titleLabel.AutoSize = $true
-$titleLabel.Location = New-Object System.Drawing.Point(12,16)
+$list = New-Object System.Windows.Forms.ListView
+$list.Dock = 'Fill'
+$list.View = 'Details'
+$list.FullRowSelect = $true
+$list.GridLines = $false
+$list.HeaderStyle = 'Nonclickable'
+$list.BackColor = [System.Drawing.Color]::FromArgb(24, 24, 24)
+$list.ForeColor = [System.Drawing.Color]::Gainsboro
+$list.BorderStyle = 'None'
+[void]$list.Columns.Add('Time', 95)
+[void]$list.Columns.Add('App', 170)
+[void]$list.Columns.Add('Path', 520)
+[void]$list.Columns.Add('User', 180)
+[void]$list.Columns.Add('Hit', 110)
 
-$autoScrollCheck = New-Object System.Windows.Forms.CheckBox
-$autoScrollCheck.Text = 'Auto scroll'
-$autoScrollCheck.Font = New-UIFont 9
-$autoScrollCheck.ForeColor = [System.Drawing.Color]::Gainsboro
-$autoScrollCheck.BackColor = [System.Drawing.Color]::FromArgb(24,24,24)
-$autoScrollCheck.AutoSize = $true
-$autoScrollCheck.Location = New-Object System.Drawing.Point(500,15)
+$load = New-Object System.Windows.Forms.Label
+$load.Dock = 'Fill'
+$load.Text = 'Loading...'
+$load.TextAlign = 'MiddleCenter'
+$load.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+$load.ForeColor = [System.Drawing.Color]::Gainsboro
+$load.BackColor = [System.Drawing.Color]::FromArgb(20, 20, 20)
 
-$speedLabel = New-Object System.Windows.Forms.Label
-$speedLabel.Text = 'Speed'
-$speedLabel.Font = New-UIFont 9
-$speedLabel.ForeColor = [System.Drawing.Color]::Gainsboro
-$speedLabel.AutoSize = $true
-$speedLabel.Location = New-Object System.Drawing.Point(615,17)
+$form.Controls.Add($list)
+$form.Controls.Add($head)
+$form.Controls.Add($load)
+$head.BringToFront()
 
-$speedBox = New-Object System.Windows.Forms.ComboBox
-$speedBox.DropDownStyle = 'DropDownList'
-$speedBox.Font = New-UIFont 9
-$speedBox.Width = 90
-$speedBox.Location = New-Object System.Drawing.Point(660,13)
-[void]$speedBox.Items.Add('Slow')
-[void]$speedBox.Items.Add('Normal')
-[void]$speedBox.Items.Add('Fast')
-$speedBox.SelectedIndex = 1
-
-$topPanel.Controls.Add($titleLabel)
-$topPanel.Controls.Add($autoScrollCheck)
-$topPanel.Controls.Add($speedLabel)
-$topPanel.Controls.Add($speedBox)
-
-$topPanel.Add_Resize({
+$form.Add_Shown({
     try {
-        $x = [Math]::Max(500, $topPanel.ClientSize.Width - 320)
-        $autoScrollCheck.Location = New-Object System.Drawing.Point($x,15)
-        $speedLabel.Location = New-Object System.Drawing.Point(($x + 115),17)
-        $speedBox.Location = New-Object System.Drawing.Point(($x + 160),13)
-        $titleLabel.MaximumSize = New-Object System.Drawing.Size(([Math]::Max(250, $x - 25)), 0)
-    } catch {}
-})
-
-$grid = New-Object System.Windows.Forms.DataGridView
-$grid.Dock = 'Fill'
-$grid.ReadOnly = $true
-$grid.AllowUserToAddRows = $false
-$grid.AllowUserToDeleteRows = $false
-$grid.AllowUserToResizeColumns = $true
-$grid.AllowUserToResizeRows = $false
-$grid.RowHeadersVisible = $false
-$grid.MultiSelect = $false
-$grid.SelectionMode = 'FullRowSelect'
-$grid.BackgroundColor = [System.Drawing.Color]::FromArgb(24,24,24)
-$grid.BorderStyle = 'None'
-$grid.GridColor = [System.Drawing.Color]::FromArgb(55,55,55)
-$grid.EnableHeadersVisualStyles = $false
-$grid.ColumnHeadersBorderStyle = 'Single'
-$grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(34,34,34)
-$grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::Gainsboro
-$grid.ColumnHeadersDefaultCellStyle.Font = New-UIFont 9 -Bold
-$grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
-$grid.ColumnHeadersHeightSizeMode = 'AutoSize'
-$grid.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
-$grid.DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gainsboro
-$grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(70,70,70)
-$grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
-$grid.DefaultCellStyle.Font = New-UIFont 9
-$grid.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
-$grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(4,2,4,2)
-$grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(36,36,36)
-$grid.RowTemplate.Height = 24
-$grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::DisplayedCells
-$grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
-$grid.ScrollBars = 'Both'
-Enable-DoubleBuffer $grid
-
-$grid.Add_DataBindingComplete({
-    param($sender,$e)
-    foreach ($col in $sender.Columns) {
-        $col.SortMode = 'NotSortable'
-        $col.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
-        switch ($col.Name) {
-            'RelativeTime' { $col.FillWeight = 13; $col.MinimumWidth = 120 }
-            'LastRun'      { $col.FillWeight = 17; $col.MinimumWidth = 150 }
-            'Application'  { $col.FillWeight = 20; $col.MinimumWidth = 170 }
-            'Path'         { $col.FillWeight = 45; $col.MinimumWidth = 310 }
-            'Signature'    { $col.FillWeight = 12; $col.MinimumWidth = 100 }
-            'KeywordHit'   { $col.FillWeight = 12; $col.MinimumWidth = 110 }
-            'UserSID'      { $col.FillWeight = 18; $col.MinimumWidth = 160 }
+        [System.Windows.Forms.Application]::DoEvents()
+        $rows = Get-BamRows
+        $list.BeginUpdate()
+        foreach ($row in $rows) {
+            $parts = $row -split '\|', 5
+            $item = New-Object System.Windows.Forms.ListViewItem($parts[0])
+            for ($i = 1; $i -lt $parts.Count; $i++) { [void]$item.SubItems.Add($parts[$i]) }
+            if ($parts.Count -ge 5 -and $parts[4]) {
+                $item.BackColor = [System.Drawing.Color]::FromArgb(84, 36, 64)
+                $item.ForeColor = [System.Drawing.Color]::White
+            }
+            [void]$list.Items.Add($item)
         }
-    }
-
-    foreach ($row in $sender.Rows) {
-        $hit = ''
-        $sig = ''
-        try { $hit = [string]$row.Cells['KeywordHit'].Value } catch {}
-        try { $sig = [string]$row.Cells['Signature'].Value } catch {}
-
-        if ($hit -or $sig -eq 'Invalid') {
-            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(84,36,64)
-            $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-        } elseif ($sig -eq 'N/A') {
-            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(70,62,28)
-            $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-        } elseif ($sig -eq 'Valid') {
-            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(28,64,42)
-            $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-        } else {
-            $row.Cells['RelativeTime'].Style.BackColor = [System.Drawing.Color]::FromArgb(92,58,24)
-            $row.Cells['RelativeTime'].Style.ForeColor = [System.Drawing.Color]::White
+    } catch {
+        $load.Text = 'Could not load BAM data.'
+        return
+    } finally {
+        $list.EndUpdate()
+        if ($form.Controls.Contains($load)) {
+            [void]$form.Controls.Remove($load)
+            $load.Dispose()
         }
     }
 })
-
-$scrollTimer = New-Object System.Windows.Forms.Timer
-$scrollTimer.Interval = 120
-$scrollTimer.Add_Tick({
-    if (-not $autoScrollCheck.Checked) { return }
-    if ($grid.RowCount -le 0) { return }
-    try {
-        $visibleCount = $grid.DisplayedRowCount($false)
-        if ($visibleCount -lt 1) { $visibleCount = 1 }
-        $maxFirst = [Math]::Max(0, $grid.RowCount - $visibleCount)
-        $step = 1
-        if ($speedBox.SelectedItem -eq 'Fast') { $step = 3 }
-        elseif ($speedBox.SelectedItem -eq 'Slow') { $step = 1 }
-        else { $step = 2 }
-        $next = $grid.FirstDisplayedScrollingRowIndex + $step
-        if ($next -gt $maxFirst) {
-            $autoScrollCheck.Checked = $false
-            return
-        }
-        $grid.FirstDisplayedScrollingRowIndex = $next
-    } catch {}
-})
-
-$autoScrollCheck.Add_CheckedChanged({
-    if ($autoScrollCheck.Checked) { $scrollTimer.Start() } else { $scrollTimer.Stop() }
-})
-
-$speedBox.Add_SelectedIndexChanged({
-    if ($speedBox.SelectedItem -eq 'Fast') { $scrollTimer.Interval = 75 }
-    elseif ($speedBox.SelectedItem -eq 'Slow') { $scrollTimer.Interval = 180 }
-    else { $scrollTimer.Interval = 120 }
-})
-
-$form.Add_FormClosing({
-    try { $scrollTimer.Stop() } catch {}
-})
-
-$form.Controls.Add($grid)
-$form.Controls.Add($topPanel)
-$grid.DataSource = $table
 
 [void]$form.ShowDialog()
 '@
@@ -1341,17 +982,31 @@ function Invoke-EmbeddedToolSection {
         return
     }
 
-    Show-LoadingBar "Launching $Title"
     Write-Host "Launching $Title..." -ForegroundColor Green
     Write-Host "Close the $Title window when finished." -ForegroundColor Yellow
     Write-Host ""
 
     try {
-        $toolBlock = [scriptblock]::Create($toolText)
-        & $toolBlock
+        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $toolProc = Start-Process -FilePath $psExe -ArgumentList @(
+            '-NoProfile',
+            '-STA',
+            '-WindowStyle', 'Hidden',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $toolPath
+        ) -WindowStyle Hidden -PassThru -Wait -ErrorAction Stop
+
+        if ($toolProc -and $toolProc.ExitCode -ne 0) {
+            Write-Host "$Title closed with exit code $($toolProc.ExitCode)." -ForegroundColor Yellow
+        }
     } catch {
-        Write-Host "$Title had an error while opening." -ForegroundColor Red
-        Write-Host "Saved copy: $toolPath" -ForegroundColor Yellow
+        try {
+            $toolBlock = [scriptblock]::Create($toolText)
+            & $toolBlock
+        } catch {
+            Write-Host "$Title had an error while opening." -ForegroundColor Red
+            Write-Host "Saved copy: $toolPath" -ForegroundColor Yellow
+        }
     }
 
     Write-Host ""
@@ -1362,7 +1017,7 @@ function Invoke-EmbeddedToolSection {
 
 function Invoke-LastActivityViewerSection {
     Clear-Host
-    Write-Host "[ Step 6 of 7 - Last Activity Viewer ]" -ForegroundColor Cyan
+    Write-Host "[ Step 5 of 6 - Last Activity Viewer ]" -ForegroundColor Cyan
     Show-LoadingBar "Step 6"
 
     Write-Host "Note: Scroll through every process since you started your OBS recording." -ForegroundColor Yellow
@@ -2080,7 +1735,7 @@ Write-Host ""
 # STEP 1 - SYSTEM CHECK
 # ===============================
 
-Write-Host "[ Step 1 of 7 - System Check ]" -ForegroundColor Cyan
+Write-Host "[ Step 1 of 6 - System Check ]" -ForegroundColor Cyan
 Show-LoadingBar "System Check"
 
 $passedChecks = 0
@@ -2336,7 +1991,7 @@ Wait-ForEnter
 # ===============================
 
 Clear-Host
-Write-Host "[ Step 2 of 7 - Process Explorer ]" -ForegroundColor Cyan
+Write-Host "[ Step 2 of 6 - Process Explorer ]" -ForegroundColor Cyan
 Show-LoadingBar "Preparing Process Explorer"
 
 $procDir = "$env:TEMP\ProcessExplorer"
@@ -2387,86 +2042,42 @@ Write-Host "Press Enter to continue..." -ForegroundColor Yellow
 Wait-ForEnter
 
 # ===============================
-# STEP 3 - USB DEVIEW
+# STEP 3 - PREFETCH REVIEW
 # ===============================
 
-Invoke-USBDeviewSection
+Invoke-EmbeddedToolSection -StepNumber 3 -TotalSteps 6 -Title 'Prefetch Review' -FileName 'PrefetchReview_Embedded.ps1' -ScriptFactory ${function:Get-EmbeddedPrefetchToolScript}
 
 # ===============================
-# STEP 4 - PREFETCH REVIEW
+# STEP 4 - BAM REVIEW
 # ===============================
 
-Invoke-EmbeddedToolSection -StepNumber 4 -TotalSteps 7 -Title 'Prefetch Review' -FileName 'PrefetchReview_Embedded.ps1' -ScriptFactory ${function:Get-EmbeddedPrefetchToolScript}
+Invoke-EmbeddedToolSection -StepNumber 4 -TotalSteps 6 -Title 'BAM Review' -FileName 'BamEntries_Embedded.ps1' -ScriptFactory ${function:Get-EmbeddedBamToolScript}
 
 # ===============================
-# STEP 5 - BAM REVIEW
-# ===============================
-
-Invoke-EmbeddedToolSection -StepNumber 5 -TotalSteps 7 -Title 'BAM Review' -FileName 'BamEntries_Embedded.ps1' -ScriptFactory ${function:Get-EmbeddedBamToolScript}
-
-# ===============================
-# STEP 6 - LAST ACTIVITY VIEWER
+# STEP 5 - LAST ACTIVITY VIEWER
 # ===============================
 
 Invoke-LastActivityViewerSection
 
 # ===============================
-# STEP 7 - MONITORING
+# STEP 6 - MONITORING
 # ===============================
 Clear-Host
-Write-Host "[ Step 7 of 7 - Monitoring ]" -ForegroundColor Cyan
-Show-LoadingBar "Step 7"
-
-$resourceMonitorProc = $null
-
-try {
-    $resourceMonitorProc = Start-Process -FilePath "$env:SystemRoot\System32\resmon.exe" -PassThru
-} catch {
-    try {
-        $resourceMonitorProc = Start-Process -FilePath "resmon.exe" -PassThru
-    } catch {}
-}
-
-Write-Host "Live Monitoring Active" -ForegroundColor Green
+Write-Host "[ Step 6 of 6 - Monitoring ]" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Keep this PowerShell window open while monitoring is active." -ForegroundColor Yellow
-Write-Host "If you need to rejoin, do not continue or close this PowerShell window. Simply run the rejoin PowerShell." -ForegroundColor Yellow
+Write-Host "Monitoring active." -ForegroundColor Green
 Write-Host ""
-Write-Host "Resource Monitor opened." -ForegroundColor Green
-Write-Host ""
-Write-Host "1. Go to Overview." -ForegroundColor White
-Write-Host "2. Go to the CPU section." -ForegroundColor White
-Write-Host "3. Scroll down and up, making sure everything is clear and easy to see." -ForegroundColor White
-Write-Host "4. Keep Resource Monitor open. You may minimize it." -ForegroundColor White
-Write-Host ""
-Write-Host "When you finish your match, press Enter to reveal all detections." -ForegroundColor Yellow
-Write-Host "Press Enter to continue..." -ForegroundColor Yellow
-Wait-ForEnter
-
-Write-Host ""
-Write-Host "Before showing detections, check Resource Monitor one more time:" -ForegroundColor Yellow
-Write-Host "1. Go to Overview." -ForegroundColor White
-Write-Host "2. Go to the CPU section." -ForegroundColor White
-Write-Host "3. Scroll down and up, making sure everything is clear and easy to see." -ForegroundColor White
-Write-Host "4. Keep Resource Monitor open. You may minimize it." -ForegroundColor White
+Write-Host "Type End to show your results." -ForegroundColor Yellow
+Write-Host "Closing the monitor before end steps will result in an immediate failure." -ForegroundColor Red
 Write-Host ""
 
-for ($i = 3; $i -ge 1; $i--) {
-    Write-Host "Detection reveal unlocks in $i second(s)..." -ForegroundColor Cyan
-    Start-Sleep -Seconds 1
-}
+while ($true) {
+    $monitorInput = Read-Host
 
-Write-Host ""
-Write-Host "Press Enter when Resource Monitor review is done..." -ForegroundColor Cyan
-Wait-ForEnter
-
-try {
-    if ($resourceMonitorProc -and -not $resourceMonitorProc.HasExited) {
-        Stop-Process -Id $resourceMonitorProc.Id -Force -ErrorAction SilentlyContinue
-    } else {
-        Get-Process -Name "resmon" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    if ($monitorInput -and $monitorInput.Trim().ToLower() -eq 'end') {
+        break
     }
-} catch {}
+}
 
 $monitorIntegrityState = "Unknown"
 $monitorIntegrityMessage = "Monitor integrity could not be verified."
@@ -2512,8 +2123,8 @@ if (Test-Path $monitorHeartbeatPath) {
 }
 
 Clear-Host
-Write-Host "[ Step 7 of 7 - Monitoring - Results ]" -ForegroundColor Cyan
-Show-LoadingBar "Step 7"
+Write-Host "[ Step 6 of 6 - Monitoring - Results ]" -ForegroundColor Cyan
+Show-LoadingBar "Step 6"
 
 Write-Host ""
 Write-Host "=== Initial System Overview ===" -ForegroundColor Cyan
