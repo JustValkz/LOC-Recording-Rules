@@ -1,3 +1,8 @@
+param(
+    [switch]$MonitorMode,
+    [string]$SessionPath
+)
+
 function Show-LoadingBar {
     param([string]$StepName)
 
@@ -24,49 +29,18 @@ function Wait-ForEnter {
     [Console]::ReadLine() | Out-Null
 }
 
-function Confirm-ShowDetectionsWithDelay {
+function Confirm-EndMonitoring {
     while ($true) {
-        Write-Host ""
-        Write-Host "Are you sure you want to show detections?" -ForegroundColor Yellow
-        Write-Host "Press Enter after the countdown to show detections, or type N then press Enter to keep monitoring." -ForegroundColor Yellow
+        Write-Host "Do you really want to end? (y/n)" -ForegroundColor Yellow
+        $answer = Read-Host
 
-        try {
-            while ([Console]::KeyAvailable) {
-                [Console]::ReadKey($true) | Out-Null
-                Start-Sleep -Milliseconds 25
-            }
-        } catch {}
-
-        for ($i = 3; $i -ge 1; $i--) {
-            Write-Host "Detection reveal unlocks in $i second(s)..." -ForegroundColor Cyan
-            Start-Sleep -Seconds 1
-        }
-
-        Write-Host "You can press Enter now to show detections, or type N then press Enter to keep monitoring." -ForegroundColor Yellow
-
-        try {
-            while ([Console]::KeyAvailable) {
-                [Console]::ReadKey($true) | Out-Null
-                Start-Sleep -Milliseconds 25
-            }
-        } catch {}
-
-        $answer = [Console]::ReadLine()
-
-        if ([string]::IsNullOrWhiteSpace($answer)) {
+        if ($answer.Trim().ToLower() -match '^y') {
             return $true
         }
 
-        if ($answer.Trim() -match '^(n|no)$') {
-            Write-Host "Detection reveal cancelled. Monitoring is still active." -ForegroundColor Green
+        if ($answer.Trim().ToLower() -match '^n') {
             return $false
         }
-
-        if ($answer.Trim() -match '^(y|yes)$') {
-            return $true
-        }
-
-        Write-Host "Invalid choice. Press Enter to show detections, or type N to keep monitoring." -ForegroundColor Yellow
     }
 }
 
@@ -287,6 +261,170 @@ function Test-StartsWithAnyPath {
     return $false
 }
 
+function Get-LocRecSessionPath {
+    param([string]$OverridePath)
+    if ($OverridePath) { return $OverridePath }
+    return (Join-Path $env:TEMP 'locrec_tier1_session.xml')
+}
+
+function Get-LocRecResultsFlagPath {
+    Join-Path $env:TEMP 'locrec_tier1_results_shown.flag'
+}
+
+function Test-LocRecMonitorActive {
+    param([string]$SessionPath)
+
+    $sessionFile = Get-LocRecSessionPath -OverridePath $SessionPath
+    if (-not (Test-Path $sessionFile)) { return $false }
+
+    try {
+        $session = Import-Clixml -Path $sessionFile
+        if (-not $session.HeartbeatPath) { return $false }
+        if (-not (Test-Path $session.HeartbeatPath)) { return $false }
+
+        $heartbeatAge = ((Get-Date) - (Get-Item $session.HeartbeatPath).LastWriteTime).TotalSeconds
+        return ($heartbeatAge -le 8)
+    } catch {
+        return $false
+    }
+}
+
+function Export-LocRecMonitorSession {
+    param(
+        [string]$SessionPath,
+        [string]$HeartbeatPath,
+        [string]$ScriptPath
+    )
+
+    $session = [ordered]@{
+        HeartbeatPath = $HeartbeatPath
+        ScriptPath    = $ScriptPath
+        LaunchedAt    = (Get-Date).ToString('o')
+    }
+
+    Export-Clixml -Path $SessionPath -InputObject $session -Force
+}
+
+function Get-LocRecScriptCachePath {
+    Join-Path $env:TEMP 'locrec_tier1_monitor.ps1'
+}
+
+function Initialize-LocRecScriptCache {
+    $cachePath = Get-LocRecScriptCachePath
+    $sourceCandidates = @(
+        $PSCommandPath,
+        $MyInvocation.MyCommand.Path,
+        $MyInvocation.PSCommandPath
+    )
+
+    foreach ($candidate in $sourceCandidates) {
+        if (-not $candidate) { continue }
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+
+        try {
+            Copy-Item -LiteralPath $candidate -Destination $cachePath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+                return $cachePath
+            }
+        } catch {}
+    }
+
+    if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+        $cachedInfo = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
+        if ($cachedInfo -and $cachedInfo.Length -gt 1000) {
+            return $cachePath
+        }
+    }
+
+    try {
+        $recentCommands = Get-History -Count 20 -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine }
+        foreach ($entry in ($recentCommands | Select-Object -Last 5)) {
+            $cmd = $entry.CommandLine
+
+            if ($cmd -match '(?i)https?://[^\s''"]+') {
+                $historyUrl = $matches[0]
+                try {
+                    Invoke-WebRequest -Uri $historyUrl -OutFile $cachePath -UseBasicParsing -ErrorAction Stop | Out-Null
+                    if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+                        $historyInfo = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
+                        if ($historyInfo -and $historyInfo.Length -gt 1000) {
+                            return $cachePath
+                        }
+                    }
+                } catch {}
+            }
+
+            if ($cmd -match "(?i)['\`"]([^'\`"]+Tier-1)['\`"]") {
+                $historyPath = $matches[1]
+                if (Test-Path -LiteralPath $historyPath -PathType Leaf) {
+                    try {
+                        Copy-Item -LiteralPath $historyPath -Destination $cachePath -Force -ErrorAction Stop
+                        if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+                            return $cachePath
+                        }
+                    } catch {}
+                }
+            }
+        }
+    } catch {}
+
+    $downloadUrls = @(
+        'https://raw.githubusercontent.com/reggiecarterthesecond-web/recording-policies/refs/heads/main/Tier-1',
+        'https://raw.githubusercontent.com/reggiecarterthesecond-web/recording-policies/refs/heads/main/tier-1'
+    )
+
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    foreach ($downloadUrl in $downloadUrls) {
+        try {
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $cachePath -UseBasicParsing -ErrorAction Stop | Out-Null
+            if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+                $downloadedInfo = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
+                if ($downloadedInfo -and $downloadedInfo.Length -gt 1000) {
+                    return $cachePath
+                }
+            }
+        } catch {}
+    }
+
+    $null
+}
+
+function Start-LocRecMonitorWindow {
+    param([string]$SessionPath)
+
+    try {
+        $monitorScript = Initialize-LocRecScriptCache
+        if (-not $monitorScript) { return }
+
+        $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        Start-Process -FilePath $psExe -ArgumentList @(
+            '-NoExit',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $monitorScript,
+            '-MonitorMode',
+            '-SessionPath', $SessionPath
+        ) -WindowStyle Normal -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+}
+
+function Invoke-LocRecMonitorMode {
+    param([string]$SessionPath)
+
+    $locRecResultsFlag = Get-LocRecResultsFlagPath
+    $locRecSessionPath = Get-LocRecSessionPath -OverridePath $SessionPath
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = Initialize-LocRecScriptCache }
+
+    Clear-Host
+    Write-Host "   __   ____  _____  ___  _____________  ___  ___  _____  _______  ___  ____  __   ___________  __  _________" -ForegroundColor Cyan
+    Write-Host "  / /  / __ \/ ___/ / _ \/ __/ ___/ __ \/ _ \/ _ \/  _/ |/ / ___/ / _ \/ __ \/ /  /  _/ ___/\ \/ / /_  __<  /" -ForegroundColor Cyan
+    Write-Host " / /__/ /_/ / /__  / , _/ _// /__/ /_/ / , _/ // // //    / (_ / / ___/ /_/ / /___/ // /__   \  /   / /  / / " -ForegroundColor Cyan
+    Write-Host "/____/\____/\___/ /_/|_/___/\___/\____/_/|_/____/___/_/|_/\___/ /_/   \____/____/___/\___/   /_/   /_/  /_/  " -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Made by Valkz + Reggie | Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
+    Write-Host ""
+
 $eventList = [System.Collections.Generic.List[string]]::new()
 
 $folderTargets = @(
@@ -376,7 +514,17 @@ $psHistoryPath = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHo
 $scriptPath = $MyInvocation.MyCommand.Path
 $currentPID = $PID
 $normalizedScriptPath = Get-NormalizedPath $scriptPath
-$monitorHeartbeatPath = Join-Path $env:TEMP ("live_monitor_" + [guid]::NewGuid().ToString("N") + ".hb")
+$monitorHeartbeatPath = $null
+    try {
+        if (Test-Path $locRecSessionPath) {
+            $loadedSession = Import-Clixml -Path $locRecSessionPath
+            if ($loadedSession.HeartbeatPath) { $monitorHeartbeatPath = $loadedSession.HeartbeatPath }
+        }
+    } catch {}
+    if (-not $monitorHeartbeatPath) {
+        $monitorHeartbeatPath = Join-Path $env:TEMP ("live_monitor_" + [guid]::NewGuid().ToString("N") + ".hb")
+    }
+    Export-LocRecMonitorSession -SessionPath $locRecSessionPath -HeartbeatPath $monitorHeartbeatPath -ScriptPath $scriptPath
 
 $monitorJob = Start-Job -Name 'LiveMonitor' -ScriptBlock {
     param(
@@ -1005,13 +1153,263 @@ $monitorJob = Start-Job -Name 'LiveMonitor' -ScriptBlock {
     }
 } -ArgumentList $folderTargets, $registryBasePaths, $psHistoryPath, $scriptPath, $currentPID, $monitorHeartbeatPath, $monitoredExePaths
 
+# ===============================
+# STEP 3 - MONITORING
+# ===============================
+Clear-Host
+Write-Host "[ Step 3 of 3 - Monitoring ]" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Monitoring active." -ForegroundColor Green
+Write-Host ""
+Write-Host "Type End then press Enter only if you're done with your match." -ForegroundColor Yellow
+Write-Host "Closing the monitor will result in an immediate failure." -ForegroundColor Red
+Write-Host ""
+
+while ($true) {
+    $monitorInput = Read-Host
+
+    if ($monitorInput -and $monitorInput.Trim().ToLower() -eq 'end') {
+        if (Confirm-EndMonitoring) {
+            break
+        }
+
+        Write-Host "Monitoring continues." -ForegroundColor Green
+    }
+}
+
+$monitorIntegrityState = "Unknown"
+$monitorIntegrityMessage = "Monitor integrity could not be verified."
+
+$jobRef = Get-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
+$heartbeatFresh = $false
+
+if ($jobRef) {
+    if ($jobRef.State -eq 'Running') {
+        if (Test-Path $monitorHeartbeatPath) {
+            try {
+                $heartbeatAge = ((Get-Date) - (Get-Item $monitorHeartbeatPath).LastWriteTime).TotalSeconds
+                if ($heartbeatAge -le 5) {
+                    $heartbeatFresh = $true
+                }
+            } catch {}
+        }
+
+        if ($heartbeatFresh) {
+            $monitorIntegrityState = "OK"
+            $monitorIntegrityMessage = "Monitor integrity: OK - live monitor heartbeat confirmed."
+        } else {
+            $monitorIntegrityState = "Warning"
+            $monitorIntegrityMessage = "Monitor integrity warning: live monitor heartbeat was stale or missing."
+        }
+    } else {
+        $monitorIntegrityState = "Warning"
+        $monitorIntegrityMessage = "Monitor integrity warning: live monitor job was not running (State: $($jobRef.State))."
+    }
+} else {
+    $monitorIntegrityState = "Warning"
+    $monitorIntegrityMessage = "Monitor integrity warning: live monitor job was missing."
+}
+
+Add-Event -List $eventList -Message $monitorIntegrityMessage
+
+Stop-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
+$liveEvents = Receive-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
+Remove-Job -Name 'LiveMonitor' -Force -ErrorAction SilentlyContinue
+
+if (Test-Path $monitorHeartbeatPath) {
+    Remove-Item $monitorHeartbeatPath -Force -ErrorAction SilentlyContinue
+}
+
+Clear-Host
+Write-Host "[ Show Results ]" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "=== Initial System Overview ===" -ForegroundColor Cyan
+
+if ($monitorIntegrityState -eq 'OK') {
+    Write-Host "Live monitor integrity: ACTIVE" -ForegroundColor Green
+} else {
+    Write-Host "Live monitor integrity: WARNING" -ForegroundColor Red
+}
+
+if ($initialUSB.Count -eq 0) {
+    Write-Host "USB drives: None connected" -ForegroundColor Green
+} else {
+    Write-Host "USB drives connected: $($initialUSB -join ', ')" -ForegroundColor Yellow
+}
+
+if ($initialExclusions.Count -eq 0) {
+    Write-Host "Defender exclusions: None" -ForegroundColor Green
+} else {
+    Write-Host "Defender exclusions active:" -ForegroundColor Red
+    foreach ($ex in $initialExclusions) {
+        Write-Host "  - $ex" -ForegroundColor Red
+    }
+}
+
+if ($initialRTP -eq $true) {
+    Write-Host "Real-time protection: ENABLED" -ForegroundColor Green
+}
+elseif ($initialRTP -eq $false) {
+    Write-Host "Real-time protection: DISABLED" -ForegroundColor Red
+}
+else {
+    Write-Host "Real-time protection: Unknown" -ForegroundColor Yellow
+}
+
+$registryIssues = $false
+foreach ($base in $registryBasePaths) {
+    if ($initialRegistry[$base].Count -gt 0) { $registryIssues = $true }
+}
+
+if (-not $registryIssues) {
+    Write-Host "Defender registry paths: Clean" -ForegroundColor Green
+} else {
+    Write-Host "Defender registry paths: Issues found" -ForegroundColor Red
+    foreach ($base in $registryBasePaths) {
+        foreach ($key in $initialRegistry[$base].Keys) {
+            Write-Host "  - $key : $($initialRegistry[$base][$key])" -ForegroundColor Red
+        }
+    }
+}
+
+$folderIssues = $false
+foreach ($folderInfo in $initialFolders.Values) {
+    if ($folderInfo.Path) { $folderIssues = $true }
+}
+
+if (-not $folderIssues) {
+    Write-Host "Monitored folders: None found (clean)" -ForegroundColor Green
+} else {
+    Write-Host "Monitored folders: Found" -ForegroundColor Red
+    foreach ($folderInfo in $initialFolders.Values) {
+        if ($folderInfo.Path) {
+            Write-Host "  - $($folderInfo.Path)" -ForegroundColor Red
+            foreach ($item in $folderInfo.Contents) {
+                Write-Host "      Content: $item" -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+if (-not $initialThreats -or $initialThreats.Count -eq 0) {
+    Write-Host "Defender threat history: None" -ForegroundColor Green
+} else {
+    Write-Host "Defender threat history:" -ForegroundColor Red
+    foreach ($t in $initialThreats) {
+        $status = switch ($t.ThreatStatus) {
+            1 { "Allowed" }
+            2 { "Quarantined" }
+            3 { "Removed" }
+            default { "Detected" }
+        }
+
+        $line = "  - $($t.ThreatName) | $status | $($t.DetectionTime)"
+        if ($line -match '(?i)roblox') {
+            Write-Host $line -ForegroundColor Yellow
+        } else {
+            Write-Host $line -ForegroundColor Red
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "=== Detection Logs ===" -ForegroundColor Cyan
+
+$groupedLive = @()
+$psCounter = 0
+$firstTimestamp = $null
+$pendingPS = $false
+
+foreach ($line in $liveEvents) {
+    if ($line -match '^\[(.*?)\] PowerShell (command executed|script executed \(\d+ lines\))') {
+        $timestamp = $matches[1]
+        if (-not $pendingPS) {
+            $firstTimestamp = $timestamp
+            $pendingPS = $true
+            $psCounter = 1
+        } else {
+            $psCounter++
+        }
+    }
+    else {
+        if ($pendingPS) {
+            $groupedLive += "[$firstTimestamp] PowerShell execution detected ($psCounter executions)"
+            $pendingPS = $false
+            $psCounter = 0
+            $firstTimestamp = $null
+        }
+
+        $groupedLive += $line
+    }
+}
+
+if ($pendingPS) {
+    $groupedLive += "[$firstTimestamp] PowerShell execution detected ($psCounter executions)"
+}
+
+$allDetections = $eventList + $groupedLive
+
+if ($allDetections.Count -eq 0) {
+    Write-Host "No detections." -ForegroundColor Green
+} else {
+    foreach ($evt in $allDetections) {
+        if ($evt -match '(?i)roblox') {
+            Write-Host $evt -ForegroundColor Yellow
+        }
+        elseif ($evt -match "USB inserted|USB removed") {
+            Write-Host $evt -ForegroundColor Yellow
+        }
+        elseif ($evt -match "Exclusion added|Exclusion removed|Real-time protection changed|Registry key|Folder CREATED|Folder DELETED|New item created|Defender threat|Defender action|Defender malware|Defender severe|Defender event|PowerShell history file was CLEARED|PowerShell history file was TRUNCATED|DNS match found|Process started|Suspicious EXE started|Running EXE detected in monitored path|Monitor integrity warning") {
+            Write-Host $evt -ForegroundColor Red
+        }
+        elseif ($evt -match "PowerShell (command|script|execution)") {
+            Write-Host $evt -ForegroundColor Magenta
+        }
+        elseif ($evt -match "Monitor integrity: OK") {
+            Write-Host $evt -ForegroundColor Green
+        }
+        else {
+            Write-Host $evt -ForegroundColor White
+        }
+    }
+}
+
+
+    try {
+        Set-Content -Path $locRecResultsFlag -Value (Get-Date).ToString('o') -Force
+    } catch {}
+
+    Write-Host ""
+    Write-Host "Results shown. You can close this window when done." -ForegroundColor Green
+}
+
+
+if ($MonitorMode) {
+    try {
+        Invoke-LocRecMonitorMode -SessionPath $SessionPath
+    } catch {}
+    return
+}
+
+$null = Initialize-LocRecScriptCache
+$scriptPath = Initialize-LocRecScriptCache
+if (-not $scriptPath) { $scriptPath = $PSCommandPath }
+$currentPID = $PID
+$normalizedScriptPath = Get-NormalizedPath $scriptPath
+$monitoredExePaths = @(
+    "$env:USERPROFILE\Downloads",
+    "$env:USERPROFILE\Desktop",
+    "$env:USERPROFILE\Documents",
+    "$env:USERPROFILE\Pictures"
+) | ForEach-Object { Get-NormalizedPath $_ } | Where-Object { $_ }
+
 Clear-Host
 Write-Host "   __   ____  _____  ___  _____________  ___  ___  _____  _______  ___  ____  __   ___________  __  _________" -ForegroundColor Cyan
 Write-Host "  / /  / __ \/ ___/ / _ \/ __/ ___/ __ \/ _ \/ _ \/  _/ |/ / ___/ / _ \/ __ \/ /  /  _/ ___/\ \/ / /_  __<  /" -ForegroundColor Cyan
 Write-Host " / /__/ /_/ / /__  / , _/ _// /__/ /_/ / , _/ // // //    / (_ / / ___/ /_/ / /___/ // /__   \  /   / /  / / " -ForegroundColor Cyan
 Write-Host "/____/\____/\___/ /_/|_/___/\___/\____/_/|_/____/___/_/|_/\___/ /_/   \____/____/___/\___/   /_/   /_/  /_/  " -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
+Write-Host "Made by Valkz + Reggie | Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
 Write-Host ""
 
 # ===============================
@@ -1388,231 +1786,49 @@ Write-Host "Press Enter to continue..." -ForegroundColor Yellow
 Wait-ForEnter
 
 # ===============================
-# STEP 3 - MONITORING
+# STEP 3 - MENU
 # ===============================
-Clear-Host
-Write-Host "[ Step 3 of 3 - Monitoring ]" -ForegroundColor Cyan
-Show-LoadingBar "Step 3"
-
-Write-Host "Live Monitoring Active" -ForegroundColor Green
-Write-Host ""
-Write-Host "Keep this PowerShell window open while monitoring is active." -ForegroundColor Yellow
-Write-Host "If you need to rejoin, do not continue or close this PowerShell window. Simply run the rejoin PowerShell." -ForegroundColor Yellow
-Write-Host ""
-
 while ($true) {
-    Write-Host "When you finish your match, press Enter to reveal all detections." -ForegroundColor Yellow
-    Write-Host "Press Enter to continue..." -ForegroundColor Yellow
-    Wait-ForEnter
-
-    if (Confirm-ShowDetectionsWithDelay) {
-        break
-    }
-
+    Clear-Host
+    Write-Host "[ Step 3 of 3 ]" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Continue monitoring. Press Enter again only when you are ready to reveal detections." -ForegroundColor Yellow
+    Write-Host "Press and Enter 1 if you're beginning steps" -ForegroundColor Yellow
+    Write-Host "Press and Enter 2 if you just finished steps" -ForegroundColor Yellow
     Write-Host ""
-}
 
-$monitorIntegrityState = "Unknown"
-$monitorIntegrityMessage = "Monitor integrity could not be verified."
+    $step3Choice = Read-Host
 
-$jobRef = Get-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
-$heartbeatFresh = $false
+    if ($step3Choice -eq '1') {
+        Clear-Host
+        Write-Host "Ensure not to close the monitor." -ForegroundColor Yellow
+        Write-Host "Press Enter to start monitor." -ForegroundColor Yellow
+        Wait-ForEnter
 
-if ($jobRef) {
-    if ($jobRef.State -eq 'Running') {
-        if (Test-Path $monitorHeartbeatPath) {
-            try {
-                $heartbeatAge = ((Get-Date) - (Get-Item $monitorHeartbeatPath).LastWriteTime).TotalSeconds
-                if ($heartbeatAge -le 5) {
-                    $heartbeatFresh = $true
-                }
-            } catch {}
+        $prevErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
+
+        try {
+            $locRecSessionPath = Get-LocRecSessionPath
+            $monitorHeartbeatPath = Join-Path $env:TEMP ("live_monitor_" + [guid]::NewGuid().ToString("N") + ".hb")
+            $cachedScriptPath = Initialize-LocRecScriptCache
+            if (-not $cachedScriptPath) { $cachedScriptPath = $scriptPath }
+
+            Export-LocRecMonitorSession -SessionPath $locRecSessionPath -HeartbeatPath $monitorHeartbeatPath -ScriptPath $cachedScriptPath
+            Start-LocRecMonitorWindow -SessionPath $locRecSessionPath
+            Start-Sleep -Milliseconds 1200
+        } catch {} finally {
+            $ErrorActionPreference = $prevErrorAction
         }
 
-        if ($heartbeatFresh) {
-            $monitorIntegrityState = "OK"
-            $monitorIntegrityMessage = "Monitor integrity: OK - live monitor heartbeat confirmed."
-        } else {
-            $monitorIntegrityState = "Warning"
-            $monitorIntegrityMessage = "Monitor integrity warning: live monitor heartbeat was stale or missing."
-        }
-    } else {
-        $monitorIntegrityState = "Warning"
-        $monitorIntegrityMessage = "Monitor integrity warning: live monitor job was not running (State: $($jobRef.State))."
+        Stop-Process -Id $PID -ErrorAction SilentlyContinue
     }
-} else {
-    $monitorIntegrityState = "Warning"
-    $monitorIntegrityMessage = "Monitor integrity warning: live monitor job was missing."
-}
-
-Add-Event -List $eventList -Message $monitorIntegrityMessage
-
-Stop-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
-$liveEvents = Receive-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
-Remove-Job -Name 'LiveMonitor' -Force -ErrorAction SilentlyContinue
-
-if (Test-Path $monitorHeartbeatPath) {
-    Remove-Item $monitorHeartbeatPath -Force -ErrorAction SilentlyContinue
-}
-
-Clear-Host
-Write-Host "[ Step 3 of 3 - Monitoring - Results ]" -ForegroundColor Cyan
-Show-LoadingBar "Step 3"
-
-Write-Host ""
-Write-Host "=== Initial System Overview ===" -ForegroundColor Cyan
-
-if ($monitorIntegrityState -eq 'OK') {
-    Write-Host "Live monitor integrity: ACTIVE" -ForegroundColor Green
-} else {
-    Write-Host "Live monitor integrity: WARNING" -ForegroundColor Red
-}
-
-if ($initialUSB.Count -eq 0) {
-    Write-Host "USB drives: None connected" -ForegroundColor Green
-} else {
-    Write-Host "USB drives connected: $($initialUSB -join ', ')" -ForegroundColor Yellow
-}
-
-if ($initialExclusions.Count -eq 0) {
-    Write-Host "Defender exclusions: None" -ForegroundColor Green
-} else {
-    Write-Host "Defender exclusions active:" -ForegroundColor Red
-    foreach ($ex in $initialExclusions) {
-        Write-Host "  - $ex" -ForegroundColor Red
+    elseif ($step3Choice -eq '2') {
+        Clear-Host
+        Write-Host "Ensure you have shown your PowerShell monitor end results." -ForegroundColor Yellow
+        Write-Host "If done, you can close this window." -ForegroundColor Green
+        Write-Host ""
+        Wait-ForEnter
+        Stop-Process -Id $PID
     }
 }
 
-if ($initialRTP -eq $true) {
-    Write-Host "Real-time protection: ENABLED" -ForegroundColor Green
-}
-elseif ($initialRTP -eq $false) {
-    Write-Host "Real-time protection: DISABLED" -ForegroundColor Red
-}
-else {
-    Write-Host "Real-time protection: Unknown" -ForegroundColor Yellow
-}
-
-$registryIssues = $false
-foreach ($base in $registryBasePaths) {
-    if ($initialRegistry[$base].Count -gt 0) { $registryIssues = $true }
-}
-
-if (-not $registryIssues) {
-    Write-Host "Defender registry paths: Clean" -ForegroundColor Green
-} else {
-    Write-Host "Defender registry paths: Issues found" -ForegroundColor Red
-    foreach ($base in $registryBasePaths) {
-        foreach ($key in $initialRegistry[$base].Keys) {
-            Write-Host "  - $key : $($initialRegistry[$base][$key])" -ForegroundColor Red
-        }
-    }
-}
-
-$folderIssues = $false
-foreach ($folderInfo in $initialFolders.Values) {
-    if ($folderInfo.Path) { $folderIssues = $true }
-}
-
-if (-not $folderIssues) {
-    Write-Host "Monitored folders: None found (clean)" -ForegroundColor Green
-} else {
-    Write-Host "Monitored folders: Found" -ForegroundColor Red
-    foreach ($folderInfo in $initialFolders.Values) {
-        if ($folderInfo.Path) {
-            Write-Host "  - $($folderInfo.Path)" -ForegroundColor Red
-            foreach ($item in $folderInfo.Contents) {
-                Write-Host "      Content: $item" -ForegroundColor Yellow
-            }
-        }
-    }
-}
-
-if (-not $initialThreats -or $initialThreats.Count -eq 0) {
-    Write-Host "Defender threat history: None" -ForegroundColor Green
-} else {
-    Write-Host "Defender threat history:" -ForegroundColor Red
-    foreach ($t in $initialThreats) {
-        $status = switch ($t.ThreatStatus) {
-            1 { "Allowed" }
-            2 { "Quarantined" }
-            3 { "Removed" }
-            default { "Detected" }
-        }
-
-        $line = "  - $($t.ThreatName) | $status | $($t.DetectionTime)"
-        if ($line -match '(?i)roblox') {
-            Write-Host $line -ForegroundColor Yellow
-        } else {
-            Write-Host $line -ForegroundColor Red
-        }
-    }
-}
-
-Write-Host ""
-Write-Host "=== Detection Logs ===" -ForegroundColor Cyan
-
-$groupedLive = @()
-$psCounter = 0
-$firstTimestamp = $null
-$pendingPS = $false
-
-foreach ($line in $liveEvents) {
-    if ($line -match '^\[(.*?)\] PowerShell (command executed|script executed \(\d+ lines\))') {
-        $timestamp = $matches[1]
-        if (-not $pendingPS) {
-            $firstTimestamp = $timestamp
-            $pendingPS = $true
-            $psCounter = 1
-        } else {
-            $psCounter++
-        }
-    }
-    else {
-        if ($pendingPS) {
-            $groupedLive += "[$firstTimestamp] PowerShell execution detected ($psCounter executions)"
-            $pendingPS = $false
-            $psCounter = 0
-            $firstTimestamp = $null
-        }
-
-        $groupedLive += $line
-    }
-}
-
-if ($pendingPS) {
-    $groupedLive += "[$firstTimestamp] PowerShell execution detected ($psCounter executions)"
-}
-
-$allDetections = $eventList + $groupedLive
-
-if ($allDetections.Count -eq 0) {
-    Write-Host "No detections." -ForegroundColor Green
-} else {
-    foreach ($evt in $allDetections) {
-        if ($evt -match '(?i)roblox') {
-            Write-Host $evt -ForegroundColor Yellow
-        }
-        elseif ($evt -match "USB inserted|USB removed") {
-            Write-Host $evt -ForegroundColor Yellow
-        }
-        elseif ($evt -match "Exclusion added|Exclusion removed|Real-time protection changed|Registry key|Folder CREATED|Folder DELETED|New item created|Defender threat|Defender action|Defender malware|Defender severe|Defender event|PowerShell history file was CLEARED|PowerShell history file was TRUNCATED|DNS match found|Process started|Suspicious EXE started|Running EXE detected in monitored path|Monitor integrity warning") {
-            Write-Host $evt -ForegroundColor Red
-        }
-        elseif ($evt -match "PowerShell (command|script|execution)") {
-            Write-Host $evt -ForegroundColor Magenta
-        }
-        elseif ($evt -match "Monitor integrity: OK") {
-            Write-Host $evt -ForegroundColor Green
-        }
-        else {
-            Write-Host $evt -ForegroundColor White
-        }
-    }
-}
-
-if (Confirm-ExitWithDelay) {
-    Stop-Process -Id $PID
-}
