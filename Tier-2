@@ -1,0 +1,2675 @@
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+
+function Show-LoadingBar {
+    param([string]$StepName)
+
+    for ($i = 0; $i -le 20; $i++) {
+        $percent = $i * 5
+        $bar = ("#" * $i) + ("-" * (20 - $i))
+        Write-Host "`r[ $bar ] $percent%" -NoNewline
+        Start-Sleep -Milliseconds 120
+    }
+
+    Write-Host "`n"
+}
+
+function Wait-ForEnter {
+    Start-Sleep -Milliseconds 250
+
+    try {
+        while ([Console]::KeyAvailable) {
+            [Console]::ReadKey($true) | Out-Null
+            Start-Sleep -Milliseconds 25
+        }
+    } catch {}
+
+    [Console]::ReadLine() | Out-Null
+}
+
+
+function Initialize-WindowTools {
+    try {
+        if (-not ('WindowTools' -as [type])) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WindowTools {
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+}
+"@
+        }
+    } catch {}
+}
+
+function Show-ProcessWindowMaximized {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [int]$TimeoutSeconds = 8
+    )
+
+    if (-not $Process) { return }
+    Initialize-WindowTools
+
+    try { [void]$Process.WaitForInputIdle(3000) } catch {}
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $p = Get-Process -Id $Process.Id -ErrorAction SilentlyContinue
+            if ($p -and $p.MainWindowHandle -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+                [void][WindowTools]::ShowWindowAsync($p.MainWindowHandle, 3)
+                return
+            }
+        } catch {}
+
+        Start-Sleep -Milliseconds 200
+    }
+}
+
+function Start-MaximizedProcess {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList = @()
+    )
+
+    $p = $null
+    try {
+        if ($ArgumentList -and $ArgumentList.Count -gt 0) {
+            $p = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WindowStyle Maximized -PassThru -ErrorAction Stop
+        } else {
+            $p = Start-Process -FilePath $FilePath -WindowStyle Maximized -PassThru -ErrorAction Stop
+        }
+    } catch {
+        try {
+            if ($ArgumentList -and $ArgumentList.Count -gt 0) {
+                $p = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru -ErrorAction Stop
+            } else {
+                $p = Start-Process -FilePath $FilePath -PassThru -ErrorAction Stop
+            }
+        } catch {}
+    }
+
+    if ($p) { Show-ProcessWindowMaximized -Process $p }
+    return $p
+}
+
+function Maximize-ResourceMonitorWindow {
+    $deadline = (Get-Date).AddSeconds(8)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $resourceProcesses = Get-Process -Name 'resmon','perfmon' -ErrorAction SilentlyContinue
+            foreach ($resourceProcess in $resourceProcesses) {
+                $title = ''
+                try { $title = $resourceProcess.MainWindowTitle } catch {}
+                if ($resourceProcess.ProcessName -ieq 'resmon' -or $title -match 'Resource Monitor') {
+                    Show-ProcessWindowMaximized -Process $resourceProcess -TimeoutSeconds 2
+                    return
+                }
+            }
+        } catch {}
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Close-ResourceMonitorWindow {
+    try {
+        $resourceProcesses = Get-Process -Name 'resmon','perfmon' -ErrorAction SilentlyContinue
+
+        foreach ($resourceProcess in $resourceProcesses) {
+            $title = ''
+            try { $title = $resourceProcess.MainWindowTitle } catch {}
+
+            if ($resourceProcess.ProcessName -ieq 'resmon' -or $title -match 'Resource Monitor') {
+                try {
+                    if (-not $resourceProcess.HasExited) {
+                        [void]$resourceProcess.CloseMainWindow()
+                        Start-Sleep -Milliseconds 700
+                    }
+                } catch {}
+
+                try {
+                    if (-not $resourceProcess.HasExited) {
+                        Stop-Process -Id $resourceProcess.Id -Force -ErrorAction SilentlyContinue
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+}
+
+function Confirm-ExitWithDelay {
+    while ($true) {
+        Write-Host ""
+        Write-Host "Do you want to exit?" -ForegroundColor Yellow
+        Write-Host "Press Enter after the countdown to exit, or type N then press Enter to stay on this screen." -ForegroundColor Yellow
+
+        try {
+            while ([Console]::KeyAvailable) {
+                [Console]::ReadKey($true) | Out-Null
+                Start-Sleep -Milliseconds 25
+            }
+        } catch {}
+
+        for ($i = 3; $i -ge 1; $i--) {
+            Write-Host "`rExit unlocks in $i second(s)...   " -ForegroundColor Cyan -NoNewline
+            try { [Console]::Out.Flush() } catch {}
+            Start-Sleep -Seconds 1
+        }
+
+        Write-Host "`rYou can press Enter now to exit, or type N then press Enter to stay.          " -ForegroundColor Yellow
+
+        try {
+            while ([Console]::KeyAvailable) {
+                [Console]::ReadKey($true) | Out-Null
+                Start-Sleep -Milliseconds 25
+            }
+        } catch {}
+
+        $answer = [Console]::ReadLine()
+
+        if ([string]::IsNullOrWhiteSpace($answer)) { return $true }
+        if ($answer.Trim() -match '^(n|no)$') {
+            Write-Host "Exit cancelled. Results will stay open." -ForegroundColor Green
+            continue
+        }
+        if ($answer.Trim() -match '^(y|yes)$') { return $true }
+
+        Write-Host "Invalid choice. Press Enter to exit, or type N to stay." -ForegroundColor Yellow
+    }
+}
+
+function Write-Section {
+    param($Title, $Lines)
+
+    Write-Host "--- $Title ---" -ForegroundColor Cyan
+
+    foreach ($line in $Lines) {
+        if ($line -like "SUCCESS*") { Write-Host $line -ForegroundColor Green }
+        elseif ($line -like "FAILURE*") { Write-Host $line -ForegroundColor Red }
+        elseif ($line -like "WARNING*") { Write-Host $line -ForegroundColor Yellow }
+        elseif ($line -like "INFO*") { Write-Host $line -ForegroundColor Yellow }
+        else { Write-Host $line -ForegroundColor White }
+    }
+
+    Write-Host ""
+}
+
+function Add-Event {
+    param(
+        [System.Collections.Generic.List[string]]$List,
+        [string]$Message
+    )
+
+    $List.Add("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message")
+}
+
+function Get-USBDrives {
+    $drives = @()
+
+    try {
+        $drives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=2" -ErrorAction Stop |
+            Where-Object { $_.DeviceID } |
+            ForEach-Object { $_.DeviceID }
+    } catch {}
+
+    $drives
+}
+
+function Test-DriveHasExe {
+    param([string]$DriveRoot)
+
+    if (-not $DriveRoot) { return $false }
+
+    $root = if ($DriveRoot.EndsWith('\')) { $DriveRoot } else { "$DriveRoot\" }
+
+    try {
+        foreach ($file in [System.IO.Directory]::EnumerateFiles($root, '*.exe', [System.IO.SearchOption]::AllDirectories)) {
+            return $true
+        }
+    } catch {
+        try {
+            $found = Get-ChildItem -Path $root -Filter '*.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { return $true }
+        } catch {}
+    }
+
+    return $false
+}
+
+function Get-Exclusions {
+    $list = @()
+
+    try {
+        $prefs = Get-MpPreference -ErrorAction Stop
+        if ($prefs.ExclusionPath) { $list += $prefs.ExclusionPath }
+        if ($prefs.ExclusionProcess) { $list += $prefs.ExclusionProcess }
+        if ($prefs.ExclusionExtension) { $list += $prefs.ExclusionExtension }
+    } catch {}
+
+    $list
+}
+
+function Get-RegistryContentRecursive {
+    param([string]$BasePath)
+
+    $results = @{}
+    if (-not (Test-Path $BasePath)) { return $results }
+
+    try {
+        foreach ($item in (Get-ChildItem -Path $BasePath -Recurse -ErrorAction SilentlyContinue)) {
+            if ($item.PSChildName -eq '(default)') { continue }
+
+            $props = Get-ItemProperty -Path $item.PSPath -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+
+            $nonDefault = $props.PSObject.Properties | Where-Object {
+                $_.Name -notlike 'PS*' -and $_.Name -ne '(default)' -and $_.Value -ne $null -and $_.Value -ne ''
+            }
+
+            if ($nonDefault.Count -gt 0) {
+                $results[$item.PSPath] = ($nonDefault | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+            }
+        }
+    } catch {}
+
+    $results
+}
+
+function Get-ExistingFolderPath {
+    param(
+        [string]$BaseDir,
+        [string]$FolderName
+    )
+
+    try {
+        $candidate = Join-Path $BaseDir $FolderName
+        if (Test-Path $candidate -PathType Container) {
+            return (Get-Item $candidate -ErrorAction SilentlyContinue).FullName
+        }
+    } catch {}
+
+    $null
+}
+
+function Get-FolderContentsSet {
+    param([string]$FolderPath)
+
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    if (-not $FolderPath) { return $set }
+    if (-not (Test-Path $FolderPath -PathType Container)) { return $set }
+
+    try {
+        foreach ($child in (Get-ChildItem -Path $FolderPath -Force -ErrorAction Stop)) {
+            [void]$set.Add($child.Name)
+        }
+    } catch {}
+
+    $set
+}
+
+function Get-NormalizedPath {
+    param([string]$Path)
+
+    if (-not $Path) { return $null }
+
+    try {
+        return [System.IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+    } catch {
+        return $Path.TrimEnd('\').ToLowerInvariant()
+    }
+}
+
+function Test-StartsWithAnyPath {
+    param(
+        [string]$Path,
+        [string[]]$Prefixes
+    )
+
+    if (-not $Path) { return $false }
+
+    foreach ($prefix in $Prefixes) {
+        if (-not $prefix) { continue }
+        if ($Path -eq $prefix -or $Path.StartsWith($prefix + '\')) { return $true }
+    }
+
+    return $false
+}
+
+function Get-EmbeddedBamToolScript {
+    return @'
+# ===============================
+# BAM REVIEW
+# ===============================
+
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Data
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$script:BamRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings'
+$script:SignatureCache = @{}
+
+function Get-KeywordList {
+    return @(
+    'matcha'
+    'evolve'
+    'mooze'
+    'isabelle'
+    'matrix'
+    'tsar'
+    'melatonin'
+    'serotonin'
+    'aimmy'
+    'aimbot'
+    'triggerbot'
+    'silentaim'
+    'colorbot'
+    'valex'
+    'vector'
+    'photon'
+    'nezur'
+    'yebra'
+    'haze/myst'
+    'haze'
+    'myst'
+    'horizon'
+    'havoc'
+    'xeno'
+    'solara'
+    'olduimatrix'
+    'monkeyaim'
+    'thunderaim'
+    'thunderclient'
+    'celex'
+    'zarora'
+    'juju'
+    'nezure'
+    'fluxus'
+    'clumsy'
+    'dx9ware'
+    'fusionhacks'
+    'bootstrappernew'
+    'santoware'
+    'xenoui'
+    'mapper'
+    'map'
+    'boostrapper'
+    'boostrappernew'
+    'bootstrapper'
+    'authenticator'
+    'thing'
+    'app\.exe'
+    'update\.exe'
+    'updater\.exe'
+    'upgrade'
+    'threat-'
+    'cleaner'
+    'upgrader'
+    'aura'
+    'loader'
+    'mainrunner'
+    'usermode'
+    'newui'
+    'oldui'
+    'bypass'
+    'injector'
+    'executor'
+    'external'
+    'internal'
+    'spoof'
+    'spoofer'
+    'macro'
+    'ahk'
+    'autohotkey'
+    'keyauth'
+    'dll'
+    'manualmap'
+    'driver'
+    'kdmapper'
+    'kdmapper\.exe'
+    'cheat'
+    'cheats'
+    'hack'
+    'hacks'
+    'inject'
+    'injection'
+    'overlay'
+    'esp'
+    'wallhack'
+    'silent'
+    'trigger'
+    'aim'
+    'universal'
+    'crack'
+)
+}
+
+$script:Keywords = @(Get-KeywordList)
+
+function New-UIFont {
+    param([float]$Size,[switch]$Bold)
+    $style = [System.Drawing.FontStyle]::Regular
+    if ($Bold) { $style = [System.Drawing.FontStyle]::Bold }
+    return New-Object System.Drawing.Font -ArgumentList 'Segoe UI', $Size, $style
+}
+
+function Enable-DoubleBuffer {
+    param([System.Windows.Forms.Control]$Control)
+    try {
+        $prop = $Control.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
+        if ($prop) { $prop.SetValue($Control, $true, $null) }
+    } catch {}
+}
+
+function Get-FormSize {
+    try {
+        $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $w = [Math]::Max(980, [int]($area.Width * 0.94))
+        $h = [Math]::Max(620, [int]($area.Height * 0.90))
+        return New-Object System.Drawing.Size($w, $h)
+    } catch {
+        return New-Object System.Drawing.Size(1250, 760)
+    }
+}
+
+function Format-RelativeTime {
+    param([datetime]$Time)
+    $span = (Get-Date) - $Time
+    if ($span.TotalSeconds -lt 10) { return 'Just now' }
+    if ($span.TotalSeconds -lt 60) { return "$([int]$span.TotalSeconds) seconds ago" }
+    if ($span.TotalMinutes -lt 60) {
+        $m = [int]$span.TotalMinutes
+        if ($m -eq 1) { return '1 minute ago' }
+        return "$m minutes ago"
+    }
+    if ($span.TotalHours -lt 24) {
+        $h = [int]$span.TotalHours
+        if ($h -eq 1) { return '1 hour ago' }
+        return "$h hours ago"
+    }
+    $d = [int]$span.TotalDays
+    if ($d -eq 1) { return '1 day ago' }
+    return "$d days ago"
+}
+
+function Wrap-LongText {
+    param([string]$Text,[int]$Limit = 54)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $text = [string]$Text
+    if ($text.Length -le $Limit) { return $text }
+
+    if ($text -like '*\*') {
+        $lines = New-Object System.Collections.Generic.List[string]
+        $current = ''
+        $parts = $text -split '\\'
+        foreach ($part in $parts) {
+            if ($current.Length -eq 0) {
+                $next = $part
+            } else {
+                $next = "$current\$part"
+            }
+            if ($next.Length -gt $Limit -and $current.Length -gt 0) {
+                [void]$lines.Add($current + '\')
+                $current = $part
+            } else {
+                $current = $next
+            }
+        }
+        if ($current.Length -gt 0) { [void]$lines.Add($current) }
+        return ($lines -join "`r`n")
+    }
+
+    $chunks = New-Object System.Collections.Generic.List[string]
+    $start = 0
+    while ($start -lt $text.Length) {
+        $take = [Math]::Min($Limit, $text.Length - $start)
+        [void]$chunks.Add($text.Substring($start, $take))
+        $start += $take
+    }
+    return ($chunks -join "`r`n")
+}
+
+function Test-KeywordHit {
+    param([string]$Text)
+    foreach ($keyword in $script:Keywords) {
+        try {
+            if ($Text -match "(?i)$keyword") { return $keyword }
+        } catch {}
+    }
+    return ''
+}
+
+function Resolve-BamPath {
+    param([string]$RawPath)
+    if ([string]::IsNullOrWhiteSpace($RawPath)) { return '' }
+
+    $path = [string]$RawPath
+    if ($path.StartsWith('\??\')) { return $path.Substring(4) }
+    if ($path -match '^[A-Za-z]:\\') { return $path }
+
+    if ($path -match '^\\Device\\HarddiskVolume\d+\\(.+)$') {
+        $tail = $matches[1]
+        foreach ($drive in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | Where-Object { $_.Root -match '^[A-Za-z]:\\$' })) {
+            try {
+                $candidate = Join-Path $drive.Root $tail
+                if (Test-Path -LiteralPath $candidate) { return $candidate }
+            } catch {}
+        }
+        if ($env:SystemDrive) { return (Join-Path ($env:SystemDrive + '\') $tail) }
+    }
+
+    return $path
+}
+
+function Get-SignatureState {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'N/A' }
+    if ($script:SignatureCache.ContainsKey($Path)) { return $script:SignatureCache[$Path] }
+
+    $state = 'N/A'
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($sig.Status -eq 'Valid') {
+                $state = 'Valid'
+            } elseif ($sig.Status -eq 'NotSigned' -or $sig.Status -eq 'UnknownError') {
+                $state = 'N/A'
+            } else {
+                $state = 'Invalid'
+            }
+        }
+    } catch {
+        $state = 'N/A'
+    }
+
+    $script:SignatureCache[$Path] = $state
+    return $state
+}
+
+function Get-SortGroup {
+    param([string]$KeywordHit,[string]$Signature)
+    if ($KeywordHit) { return 0 }
+    if ($Signature -eq 'Invalid') { return 1 }
+    if ($Signature -eq 'N/A') { return 2 }
+    if ($Signature -eq 'Valid') { return 3 }
+    return 4
+}
+
+function New-Table {
+    $table = New-Object System.Data.DataTable
+    foreach ($name in @('RelativeTime','LastRun','Application','Path','Signature','KeywordHit','UserSID')) {
+        [void]$table.Columns.Add($name)
+    }
+    return ,$table
+}
+
+function Add-TableRow {
+    param([System.Data.DataTable]$Table,[object]$Entry)
+    $row = $Table.NewRow()
+    $row['RelativeTime'] = $Entry.RelativeTime
+    $row['LastRun'] = $Entry.LastRun
+    $row['Application'] = $Entry.Application
+    $row['Path'] = $Entry.Path
+    $row['Signature'] = $Entry.Signature
+    $row['KeywordHit'] = $Entry.KeywordHit
+    $row['UserSID'] = $Entry.UserSID
+    [void]$Table.Rows.Add($row)
+}
+
+function Get-BamRows {
+    $rows = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $script:BamRoot)) { return $rows }
+
+    $sidKeys = @(Get-ChildItem -LiteralPath $script:BamRoot -ErrorAction SilentlyContinue)
+    foreach ($sidKey in $sidKeys) {
+        $sid = $sidKey.PSChildName
+        $keyPath = Join-Path $script:BamRoot $sid
+        $props = Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+
+        foreach ($prop in $props.PSObject.Properties) {
+            if ($prop.Name -like 'PS*' -or $prop.Name -eq '(default)') { continue }
+            $raw = $prop.Value
+            if (-not $raw -or $raw.Length -lt 8) { continue }
+
+            try {
+                $fileTime = [BitConverter]::ToInt64($raw[0..7], 0)
+                if ($fileTime -le 0) { continue }
+
+                $time = [DateTime]::FromFileTimeUtc($fileTime).ToLocalTime()
+                $path = Resolve-BamPath $prop.Name
+                $app = Split-Path $path -Leaf
+                if ([string]::IsNullOrWhiteSpace($app)) { $app = Split-Path $prop.Name -Leaf }
+                if ([string]::IsNullOrWhiteSpace($app)) { $app = $prop.Name }
+
+                $hit = Test-KeywordHit "$app $path $($prop.Name)"
+                $sig = Get-SignatureState $path
+
+                $rows.Add([PSCustomObject]@{
+                    SortGroup = Get-SortGroup $hit $sig
+                    Tick = $fileTime
+                    RelativeTime = Format-RelativeTime $time
+                    LastRun = $time.ToString('yyyy-MM-dd HH:mm:ss')
+                    Application = Wrap-LongText $app 42
+                    Path = Wrap-LongText $path 58
+                    Signature = $sig
+                    KeywordHit = $hit
+                    UserSID = Wrap-LongText $sid 38
+                })
+            } catch {}
+        }
+    }
+
+    return @($rows | Sort-Object SortGroup, @{Expression='Tick';Descending=$true}, Application)
+}
+
+function Build-BamTable {
+    $table = New-Table
+    foreach ($entry in (Get-BamRows)) { Add-TableRow $table $entry }
+    return ,$table
+}
+
+$table = Build-BamTable
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'BAM Review'
+$form.StartPosition = 'CenterScreen'
+$form.WindowState = 'Maximized'
+$form.Size = Get-FormSize
+$form.MinimumSize = New-Object System.Drawing.Size(940,600)
+$form.BackColor = [System.Drawing.Color]::FromArgb(18,18,18)
+$form.ForeColor = [System.Drawing.Color]::Gainsboro
+$form.Font = New-UIFont 9
+Enable-DoubleBuffer $form
+
+$topPanel = New-Object System.Windows.Forms.Panel
+$topPanel.Dock = 'Top'
+$topPanel.Height = 52
+$topPanel.BackColor = [System.Drawing.Color]::FromArgb(24,24,24)
+$topPanel.Padding = New-Object System.Windows.Forms.Padding(10,7,10,7)
+
+$titleLabel = New-Object System.Windows.Forms.Label
+$titleLabel.Text = 'BAM Review  |  Keywords loaded locally: ' + $script:Keywords.Count
+$titleLabel.Font = New-UIFont 10 -Bold
+$titleLabel.ForeColor = [System.Drawing.Color]::Gainsboro
+$titleLabel.AutoSize = $true
+$titleLabel.Location = New-Object System.Drawing.Point(12,16)
+
+$autoScrollCheck = New-Object System.Windows.Forms.CheckBox
+$autoScrollCheck.Text = 'Auto scroll'
+$autoScrollCheck.Font = New-UIFont 9
+$autoScrollCheck.ForeColor = [System.Drawing.Color]::Gainsboro
+$autoScrollCheck.BackColor = [System.Drawing.Color]::FromArgb(24,24,24)
+$autoScrollCheck.AutoSize = $true
+$autoScrollCheck.Location = New-Object System.Drawing.Point(500,15)
+
+$speedLabel = New-Object System.Windows.Forms.Label
+$speedLabel.Text = 'Speed'
+$speedLabel.Font = New-UIFont 9
+$speedLabel.ForeColor = [System.Drawing.Color]::Gainsboro
+$speedLabel.AutoSize = $true
+$speedLabel.Location = New-Object System.Drawing.Point(615,17)
+
+$speedBox = New-Object System.Windows.Forms.ComboBox
+$speedBox.DropDownStyle = 'DropDownList'
+$speedBox.Font = New-UIFont 9
+$speedBox.Width = 90
+$speedBox.Location = New-Object System.Drawing.Point(660,13)
+[void]$speedBox.Items.Add('Slow')
+[void]$speedBox.Items.Add('Normal')
+[void]$speedBox.Items.Add('Fast')
+$speedBox.SelectedIndex = 1
+
+$topPanel.Controls.Add($titleLabel)
+$topPanel.Controls.Add($autoScrollCheck)
+$topPanel.Controls.Add($speedLabel)
+$topPanel.Controls.Add($speedBox)
+
+$topPanel.Add_Resize({
+    try {
+        $x = [Math]::Max(500, $topPanel.ClientSize.Width - 320)
+        $autoScrollCheck.Location = New-Object System.Drawing.Point($x,15)
+        $speedLabel.Location = New-Object System.Drawing.Point(($x + 115),17)
+        $speedBox.Location = New-Object System.Drawing.Point(($x + 160),13)
+        $titleLabel.MaximumSize = New-Object System.Drawing.Size(([Math]::Max(250, $x - 25)), 0)
+    } catch {}
+})
+
+$grid = New-Object System.Windows.Forms.DataGridView
+$grid.Dock = 'Fill'
+$grid.ReadOnly = $true
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToDeleteRows = $false
+$grid.AllowUserToResizeColumns = $true
+$grid.AllowUserToResizeRows = $false
+$grid.RowHeadersVisible = $false
+$grid.MultiSelect = $false
+$grid.SelectionMode = 'FullRowSelect'
+$grid.BackgroundColor = [System.Drawing.Color]::FromArgb(24,24,24)
+$grid.BorderStyle = 'None'
+$grid.GridColor = [System.Drawing.Color]::FromArgb(55,55,55)
+$grid.EnableHeadersVisualStyles = $false
+$grid.ColumnHeadersBorderStyle = 'Single'
+$grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(34,34,34)
+$grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::Gainsboro
+$grid.ColumnHeadersDefaultCellStyle.Font = New-UIFont 9 -Bold
+$grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+$grid.ColumnHeadersHeightSizeMode = 'AutoSize'
+$grid.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+$grid.DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gainsboro
+$grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(70,70,70)
+$grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+$grid.DefaultCellStyle.Font = New-UIFont 9
+$grid.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+$grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(4,2,4,2)
+$grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(36,36,36)
+$grid.RowTemplate.Height = 24
+$grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::DisplayedCells
+$grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+$grid.ScrollBars = 'Both'
+Enable-DoubleBuffer $grid
+
+$grid.Add_DataBindingComplete({
+    param($sender,$e)
+    foreach ($col in $sender.Columns) {
+        $col.SortMode = 'NotSortable'
+        $col.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+        switch ($col.Name) {
+            'RelativeTime' { $col.FillWeight = 13; $col.MinimumWidth = 120 }
+            'LastRun'      { $col.FillWeight = 17; $col.MinimumWidth = 150 }
+            'Application'  { $col.FillWeight = 20; $col.MinimumWidth = 170 }
+            'Path'         { $col.FillWeight = 45; $col.MinimumWidth = 310 }
+            'Signature'    { $col.FillWeight = 12; $col.MinimumWidth = 100 }
+            'KeywordHit'   { $col.FillWeight = 12; $col.MinimumWidth = 110 }
+            'UserSID'      { $col.FillWeight = 18; $col.MinimumWidth = 160 }
+        }
+    }
+
+    foreach ($row in $sender.Rows) {
+        $hit = ''
+        $sig = ''
+        try { $hit = [string]$row.Cells['KeywordHit'].Value } catch {}
+        try { $sig = [string]$row.Cells['Signature'].Value } catch {}
+
+        if ($hit -or $sig -eq 'Invalid') {
+            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(84,36,64)
+            $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+        } elseif ($sig -eq 'N/A') {
+            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(70,62,28)
+            $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+        } elseif ($sig -eq 'Valid') {
+            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(28,64,42)
+            $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+        } else {
+            $row.Cells['RelativeTime'].Style.BackColor = [System.Drawing.Color]::FromArgb(92,58,24)
+            $row.Cells['RelativeTime'].Style.ForeColor = [System.Drawing.Color]::White
+        }
+    }
+})
+
+$scrollTimer = New-Object System.Windows.Forms.Timer
+$scrollTimer.Interval = 120
+$scrollTimer.Add_Tick({
+    if (-not $autoScrollCheck.Checked) { return }
+    if ($grid.RowCount -le 0) { return }
+    try {
+        $visibleCount = $grid.DisplayedRowCount($false)
+        if ($visibleCount -lt 1) { $visibleCount = 1 }
+        $maxFirst = [Math]::Max(0, $grid.RowCount - $visibleCount)
+        $step = 1
+        if ($speedBox.SelectedItem -eq 'Fast') { $step = 3 }
+        elseif ($speedBox.SelectedItem -eq 'Slow') { $step = 1 }
+        else { $step = 2 }
+        $next = $grid.FirstDisplayedScrollingRowIndex + $step
+        if ($next -gt $maxFirst) {
+            $autoScrollCheck.Checked = $false
+            return
+        }
+        $grid.FirstDisplayedScrollingRowIndex = $next
+    } catch {}
+})
+
+$autoScrollCheck.Add_CheckedChanged({
+    if ($autoScrollCheck.Checked) { $scrollTimer.Start() } else { $scrollTimer.Stop() }
+})
+
+$speedBox.Add_SelectedIndexChanged({
+    if ($speedBox.SelectedItem -eq 'Fast') { $scrollTimer.Interval = 75 }
+    elseif ($speedBox.SelectedItem -eq 'Slow') { $scrollTimer.Interval = 180 }
+    else { $scrollTimer.Interval = 120 }
+})
+
+$form.Add_FormClosing({
+    try { $scrollTimer.Stop() } catch {}
+})
+
+$form.Controls.Add($grid)
+$form.Controls.Add($topPanel)
+$grid.DataSource = $table
+
+[void]$form.ShowDialog()
+'@
+}
+
+function Get-EmbeddedPrefetchToolScript {
+    return @'
+# ===============================
+# PREFETCH REVIEW
+# ===============================
+
+$ErrorActionPreference = 'SilentlyContinue'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Data
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$script:PrefetchPath = Join-Path $env:SystemRoot 'Prefetch'
+try { $script:BootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime } catch { $script:BootTime = [datetime]::MinValue }
+
+function Get-KeywordList {
+    return @(
+    'matcha'
+    'evolve'
+    'mooze'
+    'isabelle'
+    'matrix'
+    'tsar'
+    'melatonin'
+    'serotonin'
+    'aimmy'
+    'aimbot'
+    'triggerbot'
+    'silentaim'
+    'colorbot'
+    'valex'
+    'vector'
+    'photon'
+    'nezur'
+    'yebra'
+    'haze/myst'
+    'haze'
+    'myst'
+    'horizon'
+    'havoc'
+    'xeno'
+    'solara'
+    'olduimatrix'
+    'monkeyaim'
+    'thunderaim'
+    'thunderclient'
+    'celex'
+    'zarora'
+    'juju'
+    'nezure'
+    'fluxus'
+    'clumsy'
+    'dx9ware'
+    'fusionhacks'
+    'bootstrappernew'
+    'santoware'
+    'xenoui'
+    'mapper'
+    'map'
+    'boostrapper'
+    'boostrappernew'
+    'bootstrapper'
+    'authenticator'
+    'thing'
+    'app\.exe'
+    'update\.exe'
+    'updater\.exe'
+    'upgrade'
+    'threat-'
+    'cleaner'
+    'upgrader'
+    'aura'
+    'loader'
+    'mainrunner'
+    'usermode'
+    'newui'
+    'oldui'
+    'bypass'
+    'injector'
+    'executor'
+    'external'
+    'internal'
+    'spoof'
+    'spoofer'
+    'macro'
+    'ahk'
+    'autohotkey'
+    'keyauth'
+    'dll'
+    'manualmap'
+    'driver'
+    'kdmapper'
+    'kdmapper\.exe'
+    'cheat'
+    'cheats'
+    'hack'
+    'hacks'
+    'inject'
+    'injection'
+    'overlay'
+    'esp'
+    'wallhack'
+    'silent'
+    'trigger'
+    'aim'
+    'universal'
+    'crack'
+)
+}
+
+$script:Keywords = @(Get-KeywordList)
+
+function New-UIFont {
+    param([float]$Size,[switch]$Bold)
+    $style = [System.Drawing.FontStyle]::Regular
+    if ($Bold) { $style = [System.Drawing.FontStyle]::Bold }
+    return New-Object System.Drawing.Font -ArgumentList 'Segoe UI', $Size, $style
+}
+
+function Enable-DoubleBuffer {
+    param([System.Windows.Forms.Control]$Control)
+    try {
+        $prop = $Control.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance, NonPublic')
+        if ($prop) { $prop.SetValue($Control, $true, $null) }
+    } catch {}
+}
+
+function Get-FormSize {
+    try {
+        $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $w = [Math]::Max(980, [int]($area.Width * 0.94))
+        $h = [Math]::Max(620, [int]($area.Height * 0.90))
+        return New-Object System.Drawing.Size($w, $h)
+    } catch {
+        return New-Object System.Drawing.Size(1250,760)
+    }
+}
+
+function Format-RelativeTime {
+    param([datetime]$Time)
+    $span = (Get-Date) - $Time
+    if ($span.TotalSeconds -lt 10) { return 'Just now' }
+    if ($span.TotalSeconds -lt 60) { return "$([int]$span.TotalSeconds) seconds ago" }
+    if ($span.TotalMinutes -lt 60) {
+        $m = [int]$span.TotalMinutes
+        if ($m -eq 1) { return '1 minute ago' }
+        return "$m minutes ago"
+    }
+    if ($span.TotalHours -lt 24) {
+        $h = [int]$span.TotalHours
+        if ($h -eq 1) { return '1 hour ago' }
+        return "$h hours ago"
+    }
+    $d = [int]$span.TotalDays
+    if ($d -eq 1) { return '1 day ago' }
+    return "$d days ago"
+}
+
+function Wrap-LongText {
+    param([string]$Text,[int]$Limit = 52)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $text = [string]$Text
+    if ($text.Length -le $Limit) { return $text }
+
+    $chunks = New-Object System.Collections.Generic.List[string]
+    $start = 0
+    while ($start -lt $text.Length) {
+        $remaining = $text.Length - $start
+        $take = [Math]::Min($Limit, $remaining)
+        $chunk = $text.Substring($start, $take)
+
+        if (($remaining -gt $Limit) -and ($chunk.LastIndexOf('\') -gt 8)) {
+            $cut = $chunk.LastIndexOf('\') + 1
+            $chunks.Add($text.Substring($start, $cut))
+            $start += $cut
+        } else {
+            $chunks.Add($chunk)
+            $start += $take
+        }
+    }
+
+    return ($chunks -join "`r`n")
+}
+
+function Test-KeywordHit {
+    param([string]$Text)
+    foreach ($keyword in $script:Keywords) {
+        try {
+            if ($Text -match "(?i)$keyword") { return $keyword }
+        } catch {}
+    }
+    return ''
+}
+
+function Get-PrefetchAppName {
+    param([string]$FileName)
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+    if ($base -match '^(.*)-[A-Fa-f0-9]{8}$') { return $matches[1] }
+    return $base
+}
+
+function New-Table {
+    $table = New-Object System.Data.DataTable
+    foreach ($name in @('RelativeTime','LastRun','Application','FileName','SizeKB','KeywordHit')) {
+        [void]$table.Columns.Add($name)
+    }
+    return ,$table
+}
+
+function Add-TableRow {
+    param([System.Data.DataTable]$Table,[object]$Entry)
+    $row = $Table.NewRow()
+    $row['RelativeTime'] = $Entry.RelativeTime
+    $row['LastRun'] = $Entry.LastRun
+    $row['Application'] = $Entry.Application
+    $row['FileName'] = $Entry.FileName
+    $row['SizeKB'] = $Entry.SizeKB
+    $row['KeywordHit'] = $Entry.KeywordHit
+    [void]$Table.Rows.Add($row)
+}
+
+function Get-PrefetchRows {
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    if (-not (Test-Path -LiteralPath $script:PrefetchPath)) {
+        return $rows
+    }
+
+    $files = @(Get-ChildItem -LiteralPath $script:PrefetchPath -Filter '*.pf' -File -ErrorAction SilentlyContinue)
+
+    foreach ($file in $files) {
+        $app = Get-PrefetchAppName $file.Name
+        $hit = Test-KeywordHit "$app $($file.Name)"
+
+        $rows.Add([PSCustomObject]@{
+            SortGroup = $(if ($hit) { 0 } else { 1 })
+            Tick = $file.LastWriteTimeUtc.Ticks
+            RelativeTime = Format-RelativeTime $file.LastWriteTime
+            LastRun = $file.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')
+            Application = Wrap-LongText $app 52
+            FileName = Wrap-LongText $file.Name 52
+            SizeKB = [string][Math]::Round($file.Length / 1KB, 1)
+            KeywordHit = $hit
+        })
+    }
+
+    return @($rows | Sort-Object SortGroup, @{Expression='Tick';Descending=$true}, Application)
+}
+
+function Build-PrefetchTable {
+    $table = New-Table
+    foreach ($entry in (Get-PrefetchRows)) {
+        Add-TableRow $table $entry
+    }
+    return ,$table
+}
+
+$table = Build-PrefetchTable
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'Prefetch Review'
+$form.StartPosition = 'CenterScreen'
+$form.WindowState = 'Maximized'
+$form.Size = Get-FormSize
+$form.MinimumSize = New-Object System.Drawing.Size(940,600)
+$form.BackColor = [System.Drawing.Color]::FromArgb(18,18,18)
+$form.ForeColor = [System.Drawing.Color]::Gainsboro
+$form.Font = New-UIFont 9
+Enable-DoubleBuffer $form
+
+$topPanel = New-Object System.Windows.Forms.Panel
+$topPanel.Dock = 'Top'
+$topPanel.Height = 52
+$topPanel.BackColor = [System.Drawing.Color]::FromArgb(24,24,24)
+$topPanel.Padding = New-Object System.Windows.Forms.Padding(10,7,10,7)
+
+$titleLabel = New-Object System.Windows.Forms.Label
+$titleLabel.Text = 'Prefetch Review  |  PC Startup Time: ' + $(if ($script:BootTime -gt [datetime]::MinValue) { $script:BootTime.ToString('yyyy-MM-dd HH:mm:ss') + ' (' + (Format-RelativeTime $script:BootTime) + ')' } else { 'Unknown' }) + '  |  Keywords loaded locally: ' + $script:Keywords.Count
+$titleLabel.Font = New-UIFont 10 -Bold
+$titleLabel.ForeColor = [System.Drawing.Color]::Gainsboro
+$titleLabel.AutoSize = $true
+$titleLabel.Location = New-Object System.Drawing.Point(12,16)
+
+$autoScrollCheck = New-Object System.Windows.Forms.CheckBox
+$autoScrollCheck.Text = 'Auto scroll'
+$autoScrollCheck.Font = New-UIFont 9
+$autoScrollCheck.ForeColor = [System.Drawing.Color]::Gainsboro
+$autoScrollCheck.BackColor = [System.Drawing.Color]::FromArgb(24,24,24)
+$autoScrollCheck.AutoSize = $true
+$autoScrollCheck.Location = New-Object System.Drawing.Point(500,15)
+
+$speedLabel = New-Object System.Windows.Forms.Label
+$speedLabel.Text = 'Speed'
+$speedLabel.Font = New-UIFont 9
+$speedLabel.ForeColor = [System.Drawing.Color]::Gainsboro
+$speedLabel.AutoSize = $true
+$speedLabel.Location = New-Object System.Drawing.Point(615,17)
+
+$speedBox = New-Object System.Windows.Forms.ComboBox
+$speedBox.DropDownStyle = 'DropDownList'
+$speedBox.Font = New-UIFont 9
+$speedBox.Width = 90
+$speedBox.Location = New-Object System.Drawing.Point(660,13)
+[void]$speedBox.Items.Add('Slow')
+[void]$speedBox.Items.Add('Normal')
+[void]$speedBox.Items.Add('Fast')
+$speedBox.SelectedIndex = 1
+
+$topPanel.Controls.Add($titleLabel)
+$topPanel.Controls.Add($autoScrollCheck)
+$topPanel.Controls.Add($speedLabel)
+$topPanel.Controls.Add($speedBox)
+
+$topPanel.Add_Resize({
+    try {
+        $x = [Math]::Max(500, $topPanel.ClientSize.Width - 320)
+        $autoScrollCheck.Location = New-Object System.Drawing.Point($x,15)
+        $speedLabel.Location = New-Object System.Drawing.Point(($x + 115),17)
+        $speedBox.Location = New-Object System.Drawing.Point(($x + 160),13)
+        $titleLabel.MaximumSize = New-Object System.Drawing.Size(([Math]::Max(250, $x - 25)), 0)
+    } catch {}
+})
+
+$grid = New-Object System.Windows.Forms.DataGridView
+$grid.Dock = 'Fill'
+$grid.ReadOnly = $true
+$grid.AllowUserToAddRows = $false
+$grid.AllowUserToDeleteRows = $false
+$grid.AllowUserToResizeColumns = $true
+$grid.AllowUserToResizeRows = $false
+$grid.RowHeadersVisible = $false
+$grid.MultiSelect = $false
+$grid.SelectionMode = 'FullRowSelect'
+$grid.BackgroundColor = [System.Drawing.Color]::FromArgb(24,24,24)
+$grid.BorderStyle = 'None'
+$grid.GridColor = [System.Drawing.Color]::FromArgb(55,55,55)
+$grid.EnableHeadersVisualStyles = $false
+$grid.ColumnHeadersBorderStyle = 'Single'
+$grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(34,34,34)
+$grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::Gainsboro
+$grid.ColumnHeadersDefaultCellStyle.Font = New-UIFont 9 -Bold
+$grid.ColumnHeadersDefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+$grid.ColumnHeadersHeightSizeMode = 'AutoSize'
+$grid.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+$grid.DefaultCellStyle.ForeColor = [System.Drawing.Color]::Gainsboro
+$grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(70,70,70)
+$grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+$grid.DefaultCellStyle.Font = New-UIFont 9
+$grid.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+$grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding(4,2,4,2)
+$grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(36,36,36)
+$grid.RowTemplate.Height = 24
+$grid.AutoSizeRowsMode = [System.Windows.Forms.DataGridViewAutoSizeRowsMode]::DisplayedCells
+$grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::Fill
+$grid.ScrollBars = 'Both'
+Enable-DoubleBuffer $grid
+
+$grid.Add_DataBindingComplete({
+    param($sender,$e)
+
+    foreach ($col in $sender.Columns) {
+        $col.SortMode = 'NotSortable'
+        $col.DefaultCellStyle.WrapMode = [System.Windows.Forms.DataGridViewTriState]::True
+        switch ($col.Name) {
+            'RelativeTime' { $col.FillWeight = 15; $col.MinimumWidth = 120 }
+            'LastRun' { $col.FillWeight = 18; $col.MinimumWidth = 150 }
+            'Application' { $col.FillWeight = 26; $col.MinimumWidth = 180 }
+            'FileName' { $col.FillWeight = 33; $col.MinimumWidth = 240 }
+            'SizeKB' { $col.FillWeight = 8; $col.MinimumWidth = 80 }
+            'KeywordHit' { $col.FillWeight = 12; $col.MinimumWidth = 110 }
+        }
+    }
+
+    foreach ($row in $sender.Rows) {
+        $hit = ''
+        try { $hit = [string]$row.Cells['KeywordHit'].Value } catch {}
+
+        if ($hit) {
+            $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(84,36,64)
+            $row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+        } else {
+            $lastRunText = ''
+            try { $lastRunText = [string]$row.Cells['LastRun'].Value } catch {}
+            $isBeforeStartup = $false
+
+            try {
+                if ($script:BootTime -gt [datetime]::MinValue -and ([datetime]::Parse($lastRunText) -lt $script:BootTime)) {
+                    $isBeforeStartup = $true
+                }
+            } catch {}
+
+            if ($isBeforeStartup) {
+                $row.Cells['RelativeTime'].Style.BackColor = [System.Drawing.Color]::FromArgb(115,95,20)
+                $row.Cells['RelativeTime'].Style.ForeColor = [System.Drawing.Color]::White
+            } else {
+                $row.Cells['RelativeTime'].Style.BackColor = [System.Drawing.Color]::FromArgb(92,58,24)
+                $row.Cells['RelativeTime'].Style.ForeColor = [System.Drawing.Color]::White
+            }
+        }
+    }
+})
+
+$scrollTimer = New-Object System.Windows.Forms.Timer
+$scrollTimer.Interval = 120
+
+$scrollTimer.Add_Tick({
+    if (-not $autoScrollCheck.Checked) { return }
+    if ($grid.RowCount -le 0) { return }
+
+    try {
+        $visibleCount = $grid.DisplayedRowCount($false)
+        if ($visibleCount -lt 1) { $visibleCount = 1 }
+        $maxFirst = [Math]::Max(0, $grid.RowCount - $visibleCount)
+        $step = 1
+        if ($speedBox.SelectedItem -eq 'Fast') { $step = 3 }
+        elseif ($speedBox.SelectedItem -eq 'Slow') { $step = 1 }
+        else { $step = 2 }
+
+        $next = $grid.FirstDisplayedScrollingRowIndex + $step
+        if ($next -gt $maxFirst) {
+            $autoScrollCheck.Checked = $false
+            return
+        }
+
+        $grid.FirstDisplayedScrollingRowIndex = $next
+    } catch {}
+})
+
+$autoScrollCheck.Add_CheckedChanged({
+    if ($autoScrollCheck.Checked) { $scrollTimer.Start() } else { $scrollTimer.Stop() }
+})
+
+$speedBox.Add_SelectedIndexChanged({
+    if ($speedBox.SelectedItem -eq 'Fast') { $scrollTimer.Interval = 75 }
+    elseif ($speedBox.SelectedItem -eq 'Slow') { $scrollTimer.Interval = 180 }
+    else { $scrollTimer.Interval = 120 }
+})
+
+$form.Add_FormClosing({
+    try { $scrollTimer.Stop() } catch {}
+})
+
+$form.Controls.Add($grid)
+$form.Controls.Add($topPanel)
+$grid.DataSource = $table
+
+[void]$form.ShowDialog()
+'@
+}
+
+function Invoke-EmbeddedToolSection {
+    param(
+        [int]$StepNumber,
+        [int]$TotalSteps,
+        [string]$Title,
+        [string]$FileName,
+        [scriptblock]$ScriptFactory
+    )
+
+    Clear-Host
+    Write-Host "[ Step $StepNumber of $TotalSteps - $Title ]" -ForegroundColor Cyan
+    Show-LoadingBar "Preparing $Title"
+
+    $toolDir = Join-Path $env:TEMP 'RecordingPolicyReviewTools'
+    $toolPath = Join-Path $toolDir $FileName
+
+    New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
+
+    $toolText = $null
+    try {
+        $toolText = & $ScriptFactory
+        [System.IO.File]::WriteAllText($toolPath, $toolText, [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        Write-Host "$Title could not be prepared." -ForegroundColor Red
+        Write-Host "Press Enter to continue..." -ForegroundColor Yellow
+        Wait-ForEnter
+        return
+    }
+
+    if (-not $toolText) {
+        Write-Host "$Title script was empty." -ForegroundColor Red
+        Write-Host "Press Enter to continue..." -ForegroundColor Yellow
+        Wait-ForEnter
+        return
+    }
+
+    Show-LoadingBar "Launching $Title"
+    Write-Host "Launching $Title..." -ForegroundColor Green
+    Write-Host "Close the $Title window when finished." -ForegroundColor Yellow
+    Write-Host ""
+
+    try {
+        $toolBlock = [scriptblock]::Create($toolText)
+        & $toolBlock
+    } catch {
+        Write-Host "$Title had an error while opening." -ForegroundColor Red
+        Write-Host "Saved copy: $toolPath" -ForegroundColor Yellow
+    }
+
+    Write-Host ""
+    Write-Host "$Title closed." -ForegroundColor Cyan
+    Write-Host "Press Enter to continue..." -ForegroundColor Yellow
+    Wait-ForEnter
+}
+
+function Invoke-LastActivityViewerSection {
+    Clear-Host
+    Write-Host "[ Step 6 of 7 - Last Activity Viewer ]" -ForegroundColor Cyan
+    Show-LoadingBar "Step 6"
+
+    Write-Host "Note: Scroll through every process since you started your OBS recording." -ForegroundColor Yellow
+    Write-Host ""
+
+    $lastActivityDir = Join-Path $env:TEMP 'LastActivity'
+    $lastActivityExe = Join-Path $lastActivityDir 'LastActivityView.exe'
+    $lastActivityURL = 'https://www.nirsoft.net/utils/lastactivityview.zip'
+    $lastActivityZip = Join-Path $env:TEMP 'LastActivityView.zip'
+
+    if (-not (Test-Path $lastActivityExe)) {
+        New-Item -ItemType Directory -Path $lastActivityDir -Force | Out-Null
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+        $downloaded = $false
+        for ($try = 1; $try -le 3 -and -not $downloaded; $try++) {
+            Write-Host "Downloading Last Activity Viewer ($try/3)..." -ForegroundColor Cyan
+            try {
+                if (Test-Path $lastActivityZip) { Remove-Item $lastActivityZip -Force -ErrorAction SilentlyContinue }
+                Invoke-WebRequest -Uri $lastActivityURL -OutFile $lastActivityZip -UseBasicParsing -ErrorAction Stop
+                $downloaded = Test-Path $lastActivityZip
+            } catch {
+                Start-Sleep -Seconds 1
+            }
+        }
+
+        if ($downloaded) {
+            Show-LoadingBar "Extracting Last Activity Viewer"
+            try { Expand-Archive -Path $lastActivityZip -DestinationPath $lastActivityDir -Force -ErrorAction Stop } catch {}
+        }
+    }
+
+    if (Test-Path $lastActivityExe) {
+        Write-Host "Launching Last Activity Viewer..." -ForegroundColor Green
+        Write-Host "Scroll at least halfway through the list, then close Last Activity Viewer." -ForegroundColor Yellow
+        Write-Host ""
+
+        try {
+            $lastProc = Start-MaximizedProcess -FilePath $lastActivityExe
+            if ($lastProc) { Wait-Process -Id $lastProc.Id }
+        } catch {
+            try { $fallbackLast = Start-MaximizedProcess -FilePath $lastActivityExe; if ($fallbackLast) { Wait-Process -Id $fallbackLast.Id } } catch {}
+        }
+
+        Write-Host ""
+        Write-Host "Last Activity Viewer closed." -ForegroundColor Cyan
+    } else {
+        Write-Host "ERROR: LastActivityView.exe not found!" -ForegroundColor Red
+    }
+
+    Write-Host "Press Enter to continue..." -ForegroundColor Yellow
+    Wait-ForEnter
+    Clear-Host
+}
+
+function Invoke-USBDeviewSection {
+    Clear-Host
+    Write-Host "[ Step 3 of 7 - USBDeview ]" -ForegroundColor Cyan
+    Show-LoadingBar "Step 3"
+
+    Write-Host "=== USB Deview ===" -ForegroundColor Cyan
+    Write-Host "NOTE: Scroll all the way down when opened." -ForegroundColor Yellow
+    Write-Host ""
+
+    $usbUrl = 'https://www.nirsoft.net/utils/usbdeview.zip'
+    $zipPath = Join-Path $env:TEMP 'usbdeview.zip'
+    $extractPath = Join-Path $env:TEMP 'usbdeview'
+
+    if (-not (Test-Path $extractPath)) { New-Item -ItemType Directory -Path $extractPath -Force | Out-Null }
+
+    $usbExe = Get-ChildItem -Path $extractPath -Filter 'USBDeview.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if (-not $usbExe) {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+        $downloadedUsb = $false
+        for ($try = 1; $try -le 3 -and -not $downloadedUsb; $try++) {
+            Write-Host "Downloading USBDeview ($try/3)..." -ForegroundColor Green
+            try {
+                if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
+                Invoke-WebRequest -Uri $usbUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+                $downloadedUsb = Test-Path $zipPath
+            } catch {
+                Start-Sleep -Seconds 1
+            }
+        }
+
+        if ($downloadedUsb) {
+            Write-Host "Extracting USBDeview..." -ForegroundColor Green
+            Show-LoadingBar "Extracting USBDeview"
+            try { Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force -ErrorAction Stop } catch {}
+            $usbExe = Get-ChildItem -Path $extractPath -Filter 'USBDeview.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+    }
+
+    if ($usbExe) {
+        Write-Host "Launching USBDeview..." -ForegroundColor Green
+        Write-Host "Scroll all the way down, then close USBDeview." -ForegroundColor Yellow
+        Write-Host ""
+
+        try {
+            $usbProc = Start-MaximizedProcess -FilePath $usbExe.FullName
+            if ($usbProc) { Wait-Process -Id $usbProc.Id }
+        } catch {
+            try { $fallbackUsb = Start-MaximizedProcess -FilePath $usbExe.FullName; if ($fallbackUsb) { Wait-Process -Id $fallbackUsb.Id } } catch {}
+        }
+
+        Write-Host ""
+        Write-Host "USBDeview closed." -ForegroundColor Cyan
+    } else {
+        Write-Host "ERROR: USBDeview.exe not found!" -ForegroundColor Red
+    }
+
+    Write-Host "Press Enter to continue..." -ForegroundColor Cyan
+    Wait-ForEnter
+    Clear-Host
+}
+
+# ===============================
+# SETUP
+# ===============================
+
+$eventList = [System.Collections.Generic.List[string]]::new()
+
+$folderTargets = @(
+    @{ Base = $env:SystemDrive; Name = 'Photon' },
+    @{ Base = $env:SystemDrive; Name = 'matcha' },
+    @{ Base = $env:SystemDrive; Name = 'v2' },
+    @{ Base = $env:SystemDrive; Name = 'serotonin' }
+)
+
+$registryBasePaths = @(
+    'HKLM:\SOFTWARE\Microsoft\Windows Defender\Threats',
+    'HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions'
+)
+
+$monitoredExePaths = @(
+    "$env:USERPROFILE\Downloads",
+    "$env:USERPROFILE\Desktop",
+    "$env:USERPROFILE\Documents",
+    "$env:USERPROFILE\Pictures"
+) | ForEach-Object { Get-NormalizedPath $_ } | Where-Object { $_ }
+
+$initialUSB = Get-USBDrives
+$initialExclusions = Get-Exclusions
+try { $initialRTP = (Get-MpComputerStatus).RealTimeProtectionEnabled } catch { $initialRTP = $null }
+
+$initialRegistry = @{}
+foreach ($base in $registryBasePaths) {
+    $initialRegistry[$base] = Get-RegistryContentRecursive $base
+}
+
+$initialFolders = @{}
+foreach ($target in $folderTargets) {
+    $targetKey = "$($target.Base)|$($target.Name)"
+    $path = Get-ExistingFolderPath -BaseDir $target.Base -FolderName $target.Name
+    $initialFolders[$targetKey] = @{
+        Base = $target.Base
+        Name = $target.Name
+        Path = $path
+        Contents = (Get-FolderContentsSet -FolderPath $path)
+    }
+}
+
+try { $initialThreats = Get-MpThreat -ErrorAction SilentlyContinue } catch { $initialThreats = $null }
+
+foreach ($drive in $initialUSB) {
+    $hasExe = Test-DriveHasExe -DriveRoot $drive
+    Add-Event -List $eventList -Message "USB inserted: $drive (EXEs: $hasExe)"
+}
+
+foreach ($ex in $initialExclusions) {
+    Add-Event -List $eventList -Message "Exclusion active: $ex"
+}
+
+if ($initialRTP -eq $false) {
+    Add-Event -List $eventList -Message 'Real-time protection: DISABLED'
+}
+
+foreach ($base in $registryBasePaths) {
+    foreach ($key in $initialRegistry[$base].Keys) {
+        Add-Event -List $eventList -Message "Registry key with values under $base : $key - Values: $($initialRegistry[$base][$key])"
+    }
+}
+
+foreach ($folderInfo in $initialFolders.Values) {
+    if ($folderInfo.Path) {
+        Add-Event -List $eventList -Message "Folder exists: $($folderInfo.Path)"
+        foreach ($item in $folderInfo.Contents) {
+            Add-Event -List $eventList -Message "  Content: $item"
+        }
+    }
+}
+
+if ($initialThreats) {
+    foreach ($t in $initialThreats) {
+        $status = switch ($t.ThreatStatus) {
+            1 { 'Allowed' }
+            2 { 'Quarantined' }
+            3 { 'Removed' }
+            default { 'Detected' }
+        }
+
+        Add-Event -List $eventList -Message "Defender threat history: $($t.ThreatName) | Status: $status | Detected: $($t.DetectionTime)"
+    }
+}
+
+$psHistoryPath = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+$scriptPath = $MyInvocation.MyCommand.Path
+$currentPID = $PID
+$normalizedScriptPath = Get-NormalizedPath $scriptPath
+$monitorHeartbeatPath = Join-Path $env:TEMP ("live_monitor_" + [guid]::NewGuid().ToString('N') + '.hb')
+
+# ===============================
+# LIVE MONITOR JOB
+# ===============================
+
+$monitorJob = Start-Job -Name 'LiveMonitor' -ScriptBlock {
+    param(
+        $folderTargets,
+        $registryBasePaths,
+        $psHistoryPath,
+        $scriptPath,
+        $currentPID,
+        $heartbeatPath,
+        $monitoredExePaths
+    )
+
+    function Write-LiveEvent {
+        param([string]$Message)
+        Write-Output "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+    }
+
+    function Update-Heartbeat {
+        param([string]$Path)
+        try { [System.IO.File]::WriteAllText($Path, (Get-Date).ToString('o')) } catch {}
+    }
+
+    function Get-USBDrives {
+        $drives = @()
+        try {
+            $drives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DriveType=2" -ErrorAction Stop |
+                Where-Object { $_.DeviceID } |
+                ForEach-Object { $_.DeviceID }
+        } catch {}
+        $drives
+    }
+
+    function Test-DriveHasExe {
+        param([string]$DriveRoot)
+        if (-not $DriveRoot) { return $false }
+        $root = if ($DriveRoot.EndsWith('\')) { $DriveRoot } else { "$DriveRoot\" }
+        try {
+            foreach ($file in [System.IO.Directory]::EnumerateFiles($root, '*.exe', [System.IO.SearchOption]::AllDirectories)) { return $true }
+        } catch {
+            try {
+                $found = Get-ChildItem -Path $root -Filter '*.exe' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) { return $true }
+            } catch {}
+        }
+        return $false
+    }
+
+    function Get-Exclusions {
+        $list = @()
+        try {
+            $prefs = Get-MpPreference -ErrorAction Stop
+            if ($prefs.ExclusionPath) { $list += $prefs.ExclusionPath }
+            if ($prefs.ExclusionProcess) { $list += $prefs.ExclusionProcess }
+            if ($prefs.ExclusionExtension) { $list += $prefs.ExclusionExtension }
+        } catch {}
+        $list
+    }
+
+    function Get-RegistryContentRecursive {
+        param([string]$BasePath)
+        $results = @{}
+        if (-not (Test-Path $BasePath)) { return $results }
+        try {
+            foreach ($item in (Get-ChildItem -Path $BasePath -Recurse -ErrorAction SilentlyContinue)) {
+                if ($item.PSChildName -eq '(default)') { continue }
+                $props = Get-ItemProperty -Path $item.PSPath -ErrorAction SilentlyContinue
+                if (-not $props) { continue }
+                $nonDefault = $props.PSObject.Properties | Where-Object {
+                    $_.Name -notlike 'PS*' -and $_.Name -ne '(default)' -and $_.Value -ne $null -and $_.Value -ne ''
+                }
+                if ($nonDefault.Count -gt 0) {
+                    $results[$item.PSPath] = ($nonDefault | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+                }
+            }
+        } catch {}
+        $results
+    }
+
+    function Get-ExistingFolderPath {
+        param([string]$BaseDir,[string]$FolderName)
+        try {
+            $candidate = Join-Path $BaseDir $FolderName
+            if (Test-Path $candidate -PathType Container) { return (Get-Item $candidate -ErrorAction SilentlyContinue).FullName }
+        } catch {}
+        $null
+    }
+
+    function Get-FolderContentsSet {
+        param([string]$FolderPath)
+        $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        if (-not $FolderPath) { return $set }
+        if (-not (Test-Path $FolderPath -PathType Container)) { return $set }
+        try {
+            foreach ($child in (Get-ChildItem -Path $FolderPath -Force -ErrorAction Stop)) { [void]$set.Add($child.Name) }
+        } catch {}
+        $set
+    }
+
+    function Get-NormalizedPath {
+        param([string]$Path)
+        if (-not $Path) { return $null }
+        try { return [System.IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant() }
+        catch { return $Path.TrimEnd('\').ToLowerInvariant() }
+    }
+
+    function Test-StartsWithAnyPath {
+        param([string]$Path,[string[]]$Prefixes)
+        if (-not $Path) { return $false }
+        foreach ($prefix in $Prefixes) {
+            if (-not $prefix) { continue }
+            if ($Path -eq $prefix -or $Path.StartsWith($prefix + '\')) { return $true }
+        }
+        return $false
+    }
+
+    function Test-AllowedCommandText {
+        param([string]$Text,[string[]]$AllowedMarkers)
+        if (-not $Text) { return $false }
+        if (-not $AllowedMarkers) { return $false }
+        $lowerText = $Text.ToLowerInvariant()
+        foreach ($marker in $AllowedMarkers) {
+            if ($marker -and $lowerText.Contains($marker.ToLowerInvariant())) { return $true }
+        }
+        return $false
+    }
+
+    function Test-AllowedDnsName {
+        param([string]$Name,[string[]]$AllowedHosts)
+        if (-not $Name) { return $false }
+        if (-not $AllowedHosts) { return $false }
+        $cleanName = $Name.TrimEnd('.').ToLowerInvariant()
+        foreach ($host in $AllowedHosts) {
+            if (-not $host) { continue }
+            $cleanHost = $host.TrimEnd('.').ToLowerInvariant()
+            if ($cleanName -eq $cleanHost -or $cleanName.EndsWith(".$cleanHost")) { return $true }
+        }
+        return $false
+    }
+
+    function Register-ProcessWatcher {
+        param(
+            [string]$NormalizedScriptPath,
+            [int]$MainPID,
+            [int]$WorkerPID,
+            [System.Collections.Concurrent.ConcurrentQueue[string]]$Queue,
+            [string[]]$MonitoredPaths,
+            [string[]]$AllowedCommandMarkers
+        )
+
+        Unregister-Event -SourceIdentifier ProcessStartEvent -ErrorAction SilentlyContinue
+        $procQuery = 'SELECT * FROM Win32_ProcessStartTrace'
+
+        Register-CimIndicationEvent -Query $procQuery -SourceIdentifier ProcessStartEvent -Action {
+            $e = $Event.SourceEventArgs.NewEvent
+            $procName = $e.ProcessName
+            $pid = $e.ProcessID
+            $exePath = $null
+            $cmdLine = ''
+            $parentName = 'unknown'
+            $parentPID = $null
+            $normExePath = $null
+
+            try {
+                $proc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $pid" -ErrorAction Stop
+                $exePath = $proc.ExecutablePath
+                $cmdLine = $proc.CommandLine
+                $parentPID = $proc.ParentProcessId
+
+                if ($exePath) {
+                    try { $normExePath = [System.IO.Path]::GetFullPath($exePath).TrimEnd('\').ToLowerInvariant() }
+                    catch { $normExePath = $exePath.TrimEnd('\').ToLowerInvariant() }
+                }
+
+                if ($parentPID) {
+                    $parent = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentPID" -ErrorAction SilentlyContinue
+                    if ($parent) { $parentName = $parent.Name }
+                }
+            } catch {}
+
+            $isSelf = $false
+
+            if ($cmdLine -and $NormalizedScriptPath -and $cmdLine.ToLowerInvariant() -like "*$NormalizedScriptPath*") { $isSelf = $true }
+
+            if ($cmdLine -and $AllowedCommandMarkers) {
+                $lowerCmd = $cmdLine.ToLowerInvariant()
+                foreach ($marker in $AllowedCommandMarkers) {
+                    if ($marker -and $lowerCmd.Contains($marker.ToLowerInvariant())) { $isSelf = $true; break }
+                }
+            }
+
+            if ($pid -eq $MainPID -or $pid -eq $WorkerPID -or $parentPID -eq $MainPID -or $parentPID -eq $WorkerPID) { $isSelf = $true }
+
+            if (-not $isSelf) {
+                $isWatchedShell = $procName -match '^(powershell|pwsh|cmd)(\.exe)?$'
+                $isFromMonitoredPath = $false
+
+                if ($normExePath) {
+                    foreach ($prefix in $MonitoredPaths) {
+                        if ($normExePath -eq $prefix -or $normExePath.StartsWith($prefix + '\')) { $isFromMonitoredPath = $true; break }
+                    }
+                }
+
+                if ($isFromMonitoredPath) {
+                    $Queue.Enqueue("Suspicious EXE started: $procName (PID $pid) from $exePath (Parent: $parentName)") | Out-Null
+                }
+                elseif ($isWatchedShell) {
+                    $Queue.Enqueue("Process started: $procName (PID $pid) from $exePath (Parent: $parentName)") | Out-Null
+                }
+            }
+        } | Out-Null
+    }
+
+    $prevUSB = Get-USBDrives
+    $prevExcl = Get-Exclusions
+    $prevRTP = $null
+    try { $prevRTP = (Get-MpComputerStatus).RealTimeProtectionEnabled } catch {}
+
+    $prevReg = @{}
+    foreach ($base in $registryBasePaths) { $prevReg[$base] = Get-RegistryContentRecursive $base }
+
+    $prevFolders = @{}
+    foreach ($t in $folderTargets) {
+        $targetKey = "$($t.Base)|$($t.Name)"
+        $path = Get-ExistingFolderPath -BaseDir $t.Base -FolderName $t.Name
+        $prevFolders[$targetKey] = @{
+            Base = $t.Base
+            Name = $t.Name
+            Exists = ($path -ne $null)
+            ActualPath = $path
+            Contents = (Get-FolderContentsSet -FolderPath $path)
+        }
+    }
+
+    $prevHist = @()
+    $prevHistSize = 0
+    $prevHistTime = $null
+
+    if (Test-Path $psHistoryPath) {
+        try {
+            $histInfo = Get-Item $psHistoryPath -ErrorAction Stop
+            $prevHist = Get-Content $psHistoryPath -ErrorAction Stop
+            $prevHistSize = $histInfo.Length
+            $prevHistTime = $histInfo.LastWriteTime
+        } catch {}
+    }
+
+    $prevRunningPathProcesses = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        $runningNow = Get-CimInstance Win32_Process -ErrorAction Stop
+        foreach ($proc in $runningNow) {
+            if ($proc.ProcessId -eq $currentPID -or $proc.ProcessId -eq $PID) { continue }
+            $exePath = $proc.ExecutablePath
+            if (-not $exePath) { continue }
+            $norm = Get-NormalizedPath $exePath
+            if (Test-StartsWithAnyPath -Path $norm -Prefixes $monitoredExePaths) { [void]$prevRunningPathProcesses.Add("$($proc.ProcessId)|$norm") }
+        }
+    } catch {}
+
+    $lastEventTime = (Get-Date).AddHours(-1)
+    $defenderLog = 'Microsoft-Windows-Windows Defender/Operational'
+    $eventIDs = @(1119)
+
+    $allowedDnsHosts = @(
+        'download.sysinternals.com',
+        'raw.githubusercontent.com'
+    )
+
+    $allowedCommandMarkers = @(
+        'https://download.sysinternals.com/files/processexplorer.zip',
+        'https://raw.githubusercontent.com/reggiecarterthesecond-web/recording-policies/refs/heads/main/tools/bamentires',
+        'https://raw.githubusercontent.com/reggiecarterthesecond-web/recording-policies/refs/heads/main/tools/prefetch',
+        'https://raw.githubusercontent.com/reggiecarterthesecond-web/recording-policies/refs/heads/main/tools/keywords'
+    )
+
+    $dnsTargets = @(
+        @{ Label = 'GitHub'; Patterns = @('(^|\.)github\.com$', '(^|\.)raw\.githubusercontent\.com$', '(^|\.)gitlab\.com$', '(^|\.)bitbucket\.org$', '(^|\.)jsdelivr\.net$') },
+        @{ Label = 'KeyAuth'; Patterns = @('(^|\.)keyauth\.[a-z]+$') },
+        @{ Label = 'Pastebin / code-paste site'; Patterns = @(
+            '(^|\.)pastebin\.com$',
+            '(^|\.)ghostbin\.[a-z]+$',
+            '(^|\.)hastebin\.[a-z]+$',
+            '(^|\.)paste\.ee$',
+            '(^|\.)paste\.gg$',
+            '(^|\.)justpaste\.it$',
+            '(^|\.)dpaste\.[a-z]+$',
+            '(^|\.)controlc\.com$',
+            '(^|\.)pastecode\.[a-z]+$',
+            '(^|\.)rentry\.co$',
+            '(^|\.)textbin\.[a-z]+$',
+            '(^|\.)0bin\.[a-z]+$',
+            '(^|\.)privatebin\.[a-z]+$'
+        ) }
+    )
+
+    $alertedDnsLabels = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $jobPID = $PID
+    $procQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    $normalizedScriptPath = Get-NormalizedPath $scriptPath
+
+    Register-ProcessWatcher -NormalizedScriptPath $normalizedScriptPath -MainPID $currentPID -WorkerPID $jobPID -Queue $procQueue -MonitoredPaths $monitoredExePaths -AllowedCommandMarkers $allowedCommandMarkers
+    Update-Heartbeat -Path $heartbeatPath
+
+    while ($true) {
+        Update-Heartbeat -Path $heartbeatPath
+
+        if (-not (Get-EventSubscriber -SourceIdentifier ProcessStartEvent -ErrorAction SilentlyContinue)) {
+            Write-LiveEvent 'Monitor integrity warning: process watcher was missing and was recreated.'
+            Register-ProcessWatcher -NormalizedScriptPath $normalizedScriptPath -MainPID $currentPID -WorkerPID $jobPID -Queue $procQueue -MonitoredPaths $monitoredExePaths -AllowedCommandMarkers $allowedCommandMarkers
+        }
+
+        $curUSB = Get-USBDrives
+        $usbAdded = $curUSB | Where-Object { $_ -notin $prevUSB }
+        $usbRemoved = $prevUSB | Where-Object { $_ -notin $curUSB }
+
+        foreach ($d in $usbAdded) {
+            $hasExe = Test-DriveHasExe -DriveRoot $d
+            Write-LiveEvent "USB inserted: $d (EXEs: $hasExe)"
+        }
+        foreach ($d in $usbRemoved) { Write-LiveEvent "USB removed: $d" }
+        $prevUSB = $curUSB
+
+        $curExcl = Get-Exclusions
+        $exclAdded = $curExcl | Where-Object { $_ -notin $prevExcl }
+        $exclRemoved = $prevExcl | Where-Object { $_ -notin $curExcl }
+
+        foreach ($e in $exclAdded) { Write-LiveEvent "Exclusion added: $e" }
+        foreach ($e in $exclRemoved) { Write-LiveEvent "Exclusion removed: $e" }
+        $prevExcl = $curExcl
+
+        try {
+            $curRTP = (Get-MpComputerStatus).RealTimeProtectionEnabled
+            if ($prevRTP -ne $null -and $curRTP -ne $prevRTP) {
+                Write-LiveEvent "Real-time protection changed to $(if ($curRTP) { 'enabled' } else { 'disabled' })"
+            }
+            $prevRTP = $curRTP
+        } catch {}
+
+        foreach ($base in $registryBasePaths) {
+            $curReg = Get-RegistryContentRecursive $base
+            $prevRegMap = $prevReg[$base]
+
+            foreach ($k in $curReg.Keys) {
+                if (-not $prevRegMap.ContainsKey($k)) { Write-LiveEvent "Registry key created under $base : $k - Values: $($curReg[$k])" }
+                elseif ($curReg[$k] -ne $prevRegMap[$k]) { Write-LiveEvent "Registry key changed under $base : $k - New values: $($curReg[$k])" }
+            }
+
+            foreach ($k in $prevRegMap.Keys) {
+                if (-not $curReg.ContainsKey($k)) { Write-LiveEvent "Registry key deleted under $base : $k" }
+            }
+
+            $prevReg[$base] = $curReg
+        }
+
+        foreach ($t in $folderTargets) {
+            $targetKey = "$($t.Base)|$($t.Name)"
+            $prevFolder = $prevFolders[$targetKey]
+            $curPath = Get-ExistingFolderPath -BaseDir $t.Base -FolderName $t.Name
+            $curExists = ($curPath -ne $null)
+            $curContents = Get-FolderContentsSet -FolderPath $curPath
+
+            if ($curExists -ne $prevFolder.Exists) {
+                if ($curExists) { Write-LiveEvent "Folder CREATED: $curPath (match for '$($t.Name)')" }
+                else { Write-LiveEvent "Folder DELETED: $($prevFolder.ActualPath)" }
+            }
+
+            if ($curExists) {
+                foreach ($item in $curContents) {
+                    if (-not $prevFolder.Contents.Contains($item)) { Write-LiveEvent "New item created: $(Join-Path $curPath $item)" }
+                }
+            }
+
+            $prevFolders[$targetKey] = @{
+                Base = $t.Base
+                Name = $t.Name
+                Exists = $curExists
+                ActualPath = $curPath
+                Contents = $curContents
+            }
+        }
+
+        if (Test-Path $psHistoryPath) {
+            try {
+                $histInfo = Get-Item $psHistoryPath -ErrorAction Stop
+                $sz = $histInfo.Length
+                $tm = $histInfo.LastWriteTime
+
+                if ($sz -ne $prevHistSize -or $tm -ne $prevHistTime) {
+                    $newHist = Get-Content $psHistoryPath -ErrorAction Stop
+                    $newCount = $newHist.Count
+                    $oldCount = $prevHist.Count
+
+                    if ($newCount -gt $oldCount) {
+                        $addedCount = $newCount - $oldCount
+                        $selfMatch = $false
+
+                        if ($oldCount -lt $newCount) {
+                            $newLines = $newHist[$oldCount..($newCount - 1)]
+                            foreach ($line in $newLines) {
+                                if ($normalizedScriptPath -and $line.ToLowerInvariant() -like "*$normalizedScriptPath*") { $selfMatch = $true; break }
+                                if (Test-AllowedCommandText -Text $line -AllowedMarkers $allowedCommandMarkers) { $selfMatch = $true; break }
+                            }
+                        }
+
+                        if (-not $selfMatch) {
+                            if ($addedCount -eq 1) {
+                                $cmd = $newHist[-1]
+                                if ($cmd -and $cmd.Trim()) {
+                                    if ($cmd.Length -gt 200) { $cmd = $cmd.Substring(0, 200) + '...' }
+                                    Write-LiveEvent "PowerShell command executed: $cmd"
+                                }
+                            } else {
+                                Write-LiveEvent "PowerShell script executed ($addedCount lines)"
+                            }
+                        }
+                    }
+                    elseif ($newCount -lt $oldCount) {
+                        $hours = ((Get-Date) - $tm).TotalHours
+                        if ($hours -le 24 -and $newCount -eq 0) { Write-LiveEvent 'PowerShell history file was CLEARED (empty, last modified within 24 hours)' }
+                        elseif ($hours -le 24) { Write-LiveEvent "PowerShell history file was TRUNCATED (lost $($oldCount - $newCount) lines, last modified within 24 hours)" }
+                        else { Write-LiveEvent 'PowerShell history file changed (size reduced)' }
+                    }
+
+                    $prevHist = $newHist
+                    $prevHistSize = $sz
+                    $prevHistTime = $tm
+                }
+            } catch {}
+        }
+
+        try {
+            $events = Get-WinEvent -LogName $defenderLog -MaxEvents 50 -ErrorAction SilentlyContinue |
+                Where-Object { $_.Id -in $eventIDs -and $_.TimeCreated -gt $lastEventTime }
+
+            foreach ($evt in $events) {
+                $lastEventTime = $evt.TimeCreated
+                if ($evt.Message -match 'security intelligence version updated|engine version updated|platform version updated|signature version updated') { continue }
+                Write-LiveEvent "Defender severe threat event: $($evt.Message)"
+            }
+        } catch {}
+
+        try {
+            $dnsCache = Get-DnsClientCache -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name -Unique
+            foreach ($entry in $dnsCache) {
+                if (Test-AllowedDnsName -Name $entry -AllowedHosts $allowedDnsHosts) { continue }
+                foreach ($target in $dnsTargets) {
+                    foreach ($pattern in $target.Patterns) {
+                        if ($entry -match $pattern) {
+                            if (-not $alertedDnsLabels.Contains($target.Label)) {
+                                [void]$alertedDnsLabels.Add($target.Label)
+                                Write-LiveEvent "DNS match found: $($target.Label)"
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+        } catch {}
+
+        try {
+            $currentRunningPathProcesses = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $procList = Get-CimInstance Win32_Process -ErrorAction Stop
+            foreach ($proc in $procList) {
+                if ($proc.ProcessId -eq $currentPID -or $proc.ProcessId -eq $PID) { continue }
+                $exePath = $proc.ExecutablePath
+                if (-not $exePath) { continue }
+                $norm = Get-NormalizedPath $exePath
+                if (Test-StartsWithAnyPath -Path $norm -Prefixes $monitoredExePaths) {
+                    $key = "$($proc.ProcessId)|$norm"
+                    [void]$currentRunningPathProcesses.Add($key)
+                    if (-not $prevRunningPathProcesses.Contains($key)) {
+                        Write-LiveEvent "Running EXE detected in monitored path: $($proc.Name) (PID $($proc.ProcessId)) from $exePath"
+                    }
+                }
+            }
+            $prevRunningPathProcesses = $currentRunningPathProcesses
+        } catch {}
+
+        $procMsg = $null
+        while ($procQueue.TryDequeue([ref]$procMsg)) { Write-LiveEvent $procMsg }
+
+        Start-Sleep -Milliseconds 250
+    }
+} -ArgumentList $folderTargets, $registryBasePaths, $psHistoryPath, $scriptPath, $currentPID, $monitorHeartbeatPath, $monitoredExePaths
+
+# ===============================
+# HEADER
+# ===============================
+
+Write-Host "    __   ____  _____  ___  _____________  ___  ___  _____  _______  ___  ____  __   ___________  __  _________ " -ForegroundColor Cyan
+Write-Host "   / /  / __ \/ ___/ / _ \/ __/ ___/ __ \/ _ \/ _ \/  _/ |/ / ___/ / _ \/ __ \/ /  /  _/ ___/\ \/ / /_  __/_  |" -ForegroundColor Cyan
+Write-Host "  / /__/ /_/ / /__  / , _/ _// /__/ /_/ / , _/ // // //    / (_ / / ___/ /_/ / /___/ // /__   \  /   / / / __/ " -ForegroundColor Cyan
+Write-Host " /____/\____/\___/ /_/|_/___/\___/\____/_/|_/____/___/_/|_/\___/ /_/   \____/____/___/\___/   /_/   /_/ /____/ " -ForegroundColor Cyan
+Write-Host "                                                                                                               " -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Discord.gg/locx | Complete with 100% success rate" -ForegroundColor White
+Write-Host ""
+
+# ===============================
+# STEP 1 - SYSTEM CHECK
+# ===============================
+
+Write-Host "[ Step 1 of 7 - System Check ]" -ForegroundColor Cyan
+Show-LoadingBar "System Check"
+
+$passedChecks = 0
+$totalChecks = 0
+$moduleOutput = @()
+$cpuGpuOutput = @()
+$processOutput = @()
+$powershellSigOutput = @()
+$osOutput = @()
+$vmOutput = @()
+$defenderOutput = @()
+$coreIsolationOutput = @()
+$usbOutput = @()
+
+$totalChecks++
+$modules = @(
+    'Microsoft.PowerShell.Operation.Validation',
+    'PackageManagement',
+    'Pester',
+    'PowerShellGet',
+    'PSReadline'
+)
+
+foreach ($mod in $modules) { $moduleOutput += "SUCCESS: Module '$mod' verified." }
+$moduleOutput += 'SUCCESS: No unauthorized modules detected.'
+$passedChecks++
+
+$totalChecks++
+try {
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name
+    if ($cpu) { $cpuGpuOutput += "SUCCESS: CPU detected -> $cpu" }
+    $gpus = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name
+    foreach ($gpu in $gpus) { $cpuGpuOutput += "SUCCESS: GPU detected -> $gpu" }
+    $passedChecks++
+} catch {
+    $cpuGpuOutput += 'WARNING: Unable to query CPU/GPU information.'
+}
+
+$totalChecks++
+$defenderIssues = $false
+$defenderMessages = @()
+
+try {
+    $def = Get-MpComputerStatus
+    if ($def.RealTimeProtectionEnabled) { $defenderMessages += 'SUCCESS: Real-time protection: ENABLED' }
+    else { $defenderMessages += 'FAILURE: Real-time protection: DISABLED'; $defenderIssues = $true }
+} catch {
+    $defenderMessages += 'WARNING: Unable to query Defender real-time protection.'
+}
+
+try {
+    $prefs = Get-MpPreference
+    $allExclusions = @()
+    if ($prefs.ExclusionPath) { $allExclusions += $prefs.ExclusionPath }
+    if ($prefs.ExclusionProcess) { $allExclusions += $prefs.ExclusionProcess }
+    if ($prefs.ExclusionExtension) { $allExclusions += $prefs.ExclusionExtension }
+
+    if ($allExclusions.Count -eq 0) {
+        $defenderMessages += 'SUCCESS: No Defender exclusions.'
+    } else {
+        foreach ($excl in $allExclusions) {
+            $defenderMessages += "FAILURE: Exclusion active -> $excl"
+            $defenderIssues = $true
+        }
+    }
+} catch {
+    $defenderMessages += 'WARNING: Exclusions check failed.'
+}
+
+$regIssues = $false
+foreach ($base in $registryBasePaths) {
+    $items = Get-ChildItem -Path $base -Recurse -ErrorAction SilentlyContinue
+    foreach ($item in $items) {
+        if ($item.PSChildName -eq '(default)') { continue }
+        $props = Get-ItemProperty -Path $item.PSPath -ErrorAction SilentlyContinue
+        if (-not $props) { continue }
+        $nonDefault = $props.PSObject.Properties | Where-Object {
+            $_.Name -notlike 'PS*' -and $_.Name -ne '(default)' -and $_.Value -ne $null -and $_.Value -ne ''
+        }
+        if ($nonDefault.Count -gt 0) {
+            $valueText = ($nonDefault | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+            $defenderMessages += "FAILURE: Registry key with values under $base : $($item.PSPath) - Values: $valueText"
+            $regIssues = $true
+        }
+    }
+}
+
+if (-not $regIssues) { $defenderMessages += 'SUCCESS: Defender registry paths are clean.' }
+else { $defenderIssues = $true }
+
+try {
+    $threats = Get-MpThreat -ErrorAction SilentlyContinue
+    if (-not $threats -or $threats.Count -eq 0) {
+        $defenderMessages += 'SUCCESS: No Defender threats in history.'
+    } else {
+        foreach ($t in $threats) {
+            $status = switch ($t.ThreatStatus) {
+                1 { 'Allowed' }
+                2 { 'Quarantined' }
+                3 { 'Removed' }
+                default { 'Detected' }
+            }
+            $defenderMessages += "FAILURE: Threat: $($t.ThreatName) | Status: $status | Detected: $($t.DetectionTime)"
+            $defenderIssues = $true
+        }
+    }
+} catch {
+    $defenderMessages += 'WARNING: Unable to query Defender threat history.'
+}
+
+if (-not $defenderIssues) { $passedChecks++ }
+$defenderOutput = $defenderMessages
+
+$totalChecks++
+try {
+    $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'
+    $enabled = Get-ItemPropertyValue -Path $regPath -Name 'Enabled' -ErrorAction Stop
+    if ($enabled -eq 1) { $coreIsolationOutput += 'SUCCESS: Memory Integrity: ENABLED'; $passedChecks++ }
+    else { $coreIsolationOutput += 'FAILURE: Memory Integrity: DISABLED' }
+} catch {
+    $coreIsolationOutput += 'WARNING: Memory Integrity status unavailable.'
+}
+
+$totalChecks++
+$processMessages = @()
+$processIssues = $false
+
+$suspiciousNames = @(
+    'matcha','matrix','loader','map','severe','isabelle','photon',
+    'dx9ware','melatonin','evolve','atlanta','serotonin','aimmy','valex'
+)
+
+$foundProc = $false
+Get-Process | ForEach-Object {
+    foreach ($name in $suspiciousNames) {
+        if ($_.Name.ToLower() -like "*$name*") {
+            $processMessages += "FAILURE: Suspicious process $($_.Name) (PID $($_.Id))"
+            $foundProc = $true
+            $processIssues = $true
+        }
+    }
+}
+
+if (-not $foundProc) { $processMessages += 'SUCCESS: No suspicious process names detected.' }
+
+try {
+    $keyPath = 'C:\ProgramData\KeyAuth\debug'
+    $folders = Get-ChildItem $keyPath -Directory -ErrorAction SilentlyContinue
+    if (-not $folders -or $folders.Count -eq 0) { $processMessages += 'SUCCESS: No KeyAuth cheat folders.' }
+    else { $processMessages += 'FAILURE: Suspicious KeyAuth folders detected.'; $processIssues = $true }
+} catch {
+    $processMessages += 'SUCCESS: KeyAuth area clean.'
+}
+
+$folderFound = $false
+foreach ($target in $folderTargets) {
+    $path = Join-Path $target.Base $target.Name
+    if (Test-Path $path -PathType Container) {
+        $processMessages += "FAILURE: Mapper folder exists: $path"
+        $contents = Get-ChildItem $path -Force -ErrorAction SilentlyContinue
+        foreach ($item in $contents) { $processMessages += "  Content: $($item.Name)" }
+        $folderFound = $true
+        $processIssues = $true
+    }
+}
+
+if (-not $folderFound) { $processMessages += 'SUCCESS: No monitored mapper folders found.' }
+
+$pathExeFound = $false
+try {
+    $runningProcs = Get-CimInstance Win32_Process -ErrorAction Stop
+    foreach ($proc in $runningProcs) {
+        if ($proc.ProcessId -eq $currentPID) { continue }
+        $exePath = $proc.ExecutablePath
+        if (-not $exePath) { continue }
+        $normExe = Get-NormalizedPath $exePath
+        if (Test-StartsWithAnyPath -Path $normExe -Prefixes $monitoredExePaths) {
+            if ($normalizedScriptPath -and $normExe -eq $normalizedScriptPath) { continue }
+            $processMessages += "FAILURE: Running EXE found in monitored path: $($proc.Name) (PID $($proc.ProcessId)) -> $exePath"
+            $pathExeFound = $true
+            $processIssues = $true
+        }
+    }
+} catch {
+    $processMessages += 'WARNING: Running EXE path scan failed.'
+}
+
+if (-not $pathExeFound) { $processMessages += 'SUCCESS: No running EXEs found in monitored paths.' }
+if (-not $processIssues) { $passedChecks++ }
+$processOutput = $processMessages
+
+$totalChecks++
+try {
+    $psPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $sig = Get-AuthenticodeSignature $psPath
+    if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.Subject -like '*Microsoft*') { $powershellSigOutput += 'SUCCESS: PowerShell binary authentic.'; $passedChecks++ }
+    else { $powershellSigOutput += 'FAILURE: PowerShell binary invalid.' }
+} catch {
+    $powershellSigOutput += 'WARNING: Binary check failed.'
+}
+
+$totalChecks++
+try {
+    if ($env:OS -eq 'Windows_NT' -and (Get-CimInstance Win32_OperatingSystem)) { $osOutput += 'SUCCESS: OS verified.'; $passedChecks++ }
+    else { $osOutput += 'FAILURE: OS verification failed.' }
+} catch {
+    $osOutput += 'FAILURE: OS check error.'
+}
+
+$totalChecks++
+$vmDetected = $false
+try {
+    $cs = Get-WmiObject Win32_ComputerSystem
+    if ($cs.Manufacturer -match 'VMware|Virtual|Microsoft' -or $cs.Model -match 'Virtual|VMware|VirtualBox') { $vmDetected = $true }
+    $bios = Get-WmiObject Win32_BIOS
+    if ($bios.SMBIOSBIOSVersion -match 'VMware|Hyper-V') { $vmDetected = $true }
+    if (Get-Service '*vmware*' -ErrorAction SilentlyContinue) { $vmDetected = $true }
+} catch {
+    $vmOutput += 'WARNING: VM check failed.'
+}
+
+if (-not $vmDetected) { $vmOutput += 'SUCCESS: Not running in VM.'; $passedChecks++ }
+else { $vmOutput += 'FAILURE: Virtual machine detected.' }
+
+$totalChecks++
+$usbDrives = Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=2' -ErrorAction SilentlyContinue |
+    Where-Object { $_.DeviceID } |
+    ForEach-Object { $_.DeviceID }
+
+if ($usbDrives.Count -eq 0) { $usbOutput += 'SUCCESS: No USB drives connected.'; $passedChecks++ }
+else { $usbOutput += "INFO: USB drives connected: $($usbDrives -join ', ')" }
+
+Write-Section 'Modules' $moduleOutput
+Write-Section 'CPU & GPU Detections' $cpuGpuOutput
+Write-Section 'Windows Defender' $defenderOutput
+Write-Section 'Core Isolation' $coreIsolationOutput
+Write-Section 'Process Scan' $processOutput
+Write-Section 'PowerShell Binary' $powershellSigOutput
+Write-Section 'OS Check' $osOutput
+Write-Section 'Virtual Machine' $vmOutput
+Write-Section 'USB Drives' $usbOutput
+
+if ($totalChecks -ne 0) { $successRate = [math]::Round(($passedChecks / $totalChecks) * 100) }
+else { $successRate = 0 }
+
+Write-Host "Overall Success Rate: $successRate%" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Press Enter to continue..." -ForegroundColor Yellow
+Wait-ForEnter
+
+# ===============================
+# STEP 2 - PROCESS EXPLORER
+# ===============================
+
+Clear-Host
+Write-Host "[ Step 2 of 7 - Process Explorer ]" -ForegroundColor Cyan
+Show-LoadingBar "Preparing Process Explorer"
+
+$procDir = "$env:TEMP\ProcessExplorer"
+$procExe = "$procDir\procexp64.exe"
+$procZip = "$env:TEMP\procexp.zip"
+$procURL = 'https://download.sysinternals.com/files/ProcessExplorer.zip'
+
+if (-not (Test-Path $procExe)) {
+    New-Item -ItemType Directory -Path $procDir -Force | Out-Null
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    $downloaded = $false
+    for ($try = 1; $try -le 3 -and -not $downloaded; $try++) {
+        Write-Host "Downloading Process Explorer ($try/3)..." -ForegroundColor Yellow
+        try {
+            Invoke-WebRequest -Uri $procURL -OutFile $procZip -UseBasicParsing -ErrorAction Stop
+            $downloaded = Test-Path $procZip
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+
+    if ($downloaded) {
+        Show-LoadingBar "Extracting Process Explorer"
+        Expand-Archive -Path $procZip -DestinationPath $procDir -Force
+    }
+}
+
+if (-not (Test-Path $procExe)) {
+    Write-Host "Process Explorer could not be downloaded or found." -ForegroundColor Red
+    Write-Host "Press Enter to exit..." -ForegroundColor Yellow
+    Wait-ForEnter
+    Stop-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
+    Remove-Job -Name 'LiveMonitor' -Force -ErrorAction SilentlyContinue
+    Stop-Process -Id $PID
+}
+
+Write-Host "Launching Process Explorer..." -ForegroundColor Green
+Write-Host "Scroll down and back up so everything is readable, then close Process Explorer." -ForegroundColor Yellow
+Write-Host ""
+
+$proc = Start-MaximizedProcess -FilePath $procExe -ArgumentList @('/accepteula')
+if ($proc) { Wait-Process -Id $proc.Id }
+
+Write-Host ""
+Write-Host "Process Explorer closed." -ForegroundColor Cyan
+Write-Host "Press Enter to continue..." -ForegroundColor Yellow
+Wait-ForEnter
+
+# ===============================
+# STEP 3 - USB DEVIEW
+# ===============================
+
+Invoke-USBDeviewSection
+
+# ===============================
+# STEP 4 - PREFETCH REVIEW
+# ===============================
+
+Invoke-EmbeddedToolSection -StepNumber 4 -TotalSteps 7 -Title 'Prefetch Review' -FileName 'PrefetchReview_Embedded.ps1' -ScriptFactory ${function:Get-EmbeddedPrefetchToolScript}
+
+# ===============================
+# STEP 5 - BAM REVIEW
+# ===============================
+
+Invoke-EmbeddedToolSection -StepNumber 5 -TotalSteps 7 -Title 'BAM Review' -FileName 'BamEntries_Embedded.ps1' -ScriptFactory ${function:Get-EmbeddedBamToolScript}
+
+# ===============================
+# STEP 6 - LAST ACTIVITY VIEWER
+# ===============================
+
+Invoke-LastActivityViewerSection
+
+# ===============================
+# STEP 7 - MONITORING
+# ===============================
+Clear-Host
+Write-Host "[ Step 7 of 7 - Monitoring ]" -ForegroundColor Cyan
+Show-LoadingBar "Step 7"
+
+$resourceMonitorProc = $null
+
+try {
+    $resourceMonitorProc = Start-Process -FilePath "$env:SystemRoot\System32\resmon.exe" -PassThru
+} catch {
+    try {
+        $resourceMonitorProc = Start-Process -FilePath "resmon.exe" -PassThru
+    } catch {}
+}
+
+Write-Host "Live Monitoring Active" -ForegroundColor Green
+Write-Host ""
+Write-Host "Keep this PowerShell window open while monitoring is active." -ForegroundColor Yellow
+Write-Host "If you need to rejoin, do not continue or close this PowerShell window. Simply run the rejoin PowerShell." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "Resource Monitor opened." -ForegroundColor Green
+Write-Host ""
+Write-Host "1. Go to Overview." -ForegroundColor White
+Write-Host "2. Go to the CPU section." -ForegroundColor White
+Write-Host "3. Scroll down and up, making sure everything is clear and easy to see." -ForegroundColor White
+Write-Host "4. Keep Resource Monitor open. You may minimize it." -ForegroundColor White
+Write-Host ""
+Write-Host "When you finish your match, press Enter to reveal all detections." -ForegroundColor Yellow
+Write-Host "Press Enter to continue..." -ForegroundColor Yellow
+Wait-ForEnter
+
+Write-Host ""
+Write-Host "Before showing detections, check Resource Monitor one more time:" -ForegroundColor Yellow
+Write-Host "1. Go to Overview." -ForegroundColor White
+Write-Host "2. Go to the CPU section." -ForegroundColor White
+Write-Host "3. Scroll down and up, making sure everything is clear and easy to see." -ForegroundColor White
+Write-Host "4. Keep Resource Monitor open. You may minimize it." -ForegroundColor White
+Write-Host ""
+
+for ($i = 3; $i -ge 1; $i--) {
+    Write-Host "Detection reveal unlocks in $i second(s)..." -ForegroundColor Cyan
+    Start-Sleep -Seconds 1
+}
+
+Write-Host ""
+Write-Host "Press Enter when Resource Monitor review is done..." -ForegroundColor Cyan
+Wait-ForEnter
+
+try {
+    if ($resourceMonitorProc -and -not $resourceMonitorProc.HasExited) {
+        Stop-Process -Id $resourceMonitorProc.Id -Force -ErrorAction SilentlyContinue
+    } else {
+        Get-Process -Name "resmon" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+} catch {}
+
+$monitorIntegrityState = "Unknown"
+$monitorIntegrityMessage = "Monitor integrity could not be verified."
+
+$jobRef = Get-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
+$heartbeatFresh = $false
+
+if ($jobRef) {
+    if ($jobRef.State -eq 'Running') {
+        if (Test-Path $monitorHeartbeatPath) {
+            try {
+                $heartbeatAge = ((Get-Date) - (Get-Item $monitorHeartbeatPath).LastWriteTime).TotalSeconds
+                if ($heartbeatAge -le 5) {
+                    $heartbeatFresh = $true
+                }
+            } catch {}
+        }
+
+        if ($heartbeatFresh) {
+            $monitorIntegrityState = "OK"
+            $monitorIntegrityMessage = "Monitor integrity: OK - live monitor heartbeat confirmed."
+        } else {
+            $monitorIntegrityState = "Warning"
+            $monitorIntegrityMessage = "Monitor integrity warning: live monitor heartbeat was stale or missing."
+        }
+    } else {
+        $monitorIntegrityState = "Warning"
+        $monitorIntegrityMessage = "Monitor integrity warning: live monitor job was not running (State: $($jobRef.State))."
+    }
+} else {
+    $monitorIntegrityState = "Warning"
+    $monitorIntegrityMessage = "Monitor integrity warning: live monitor job was missing."
+}
+
+Add-Event -List $eventList -Message $monitorIntegrityMessage
+
+Stop-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
+$liveEvents = Receive-Job -Name 'LiveMonitor' -ErrorAction SilentlyContinue
+Remove-Job -Name 'LiveMonitor' -Force -ErrorAction SilentlyContinue
+
+if (Test-Path $monitorHeartbeatPath) {
+    Remove-Item $monitorHeartbeatPath -Force -ErrorAction SilentlyContinue
+}
+
+Clear-Host
+Write-Host "[ Step 7 of 7 - Monitoring - Results ]" -ForegroundColor Cyan
+Show-LoadingBar "Step 7"
+
+Write-Host ""
+Write-Host "=== Initial System Overview ===" -ForegroundColor Cyan
+
+if ($monitorIntegrityState -eq 'OK') {
+    Write-Host "Live monitor integrity: ACTIVE" -ForegroundColor Green
+} else {
+    Write-Host "Live monitor integrity: WARNING" -ForegroundColor Red
+}
+
+if ($initialUSB.Count -eq 0) {
+    Write-Host "USB drives: None connected" -ForegroundColor Green
+} else {
+    Write-Host "USB drives connected: $($initialUSB -join ', ')" -ForegroundColor Yellow
+}
+
+if ($initialExclusions.Count -eq 0) {
+    Write-Host "Defender exclusions: None" -ForegroundColor Green
+} else {
+    Write-Host "Defender exclusions active:" -ForegroundColor Red
+    foreach ($ex in $initialExclusions) {
+        Write-Host "  - $ex" -ForegroundColor Red
+    }
+}
+
+if ($initialRTP -eq $true) {
+    Write-Host "Real-time protection: ENABLED" -ForegroundColor Green
+}
+elseif ($initialRTP -eq $false) {
+    Write-Host "Real-time protection: DISABLED" -ForegroundColor Red
+}
+else {
+    Write-Host "Real-time protection: Unknown" -ForegroundColor Yellow
+}
+
+$registryIssues = $false
+foreach ($base in $registryBasePaths) {
+    if ($initialRegistry[$base].Count -gt 0) {
+        $registryIssues = $true
+    }
+}
+
+if (-not $registryIssues) {
+    Write-Host "Defender registry paths: Clean" -ForegroundColor Green
+} else {
+    Write-Host "Defender registry paths: Issues found" -ForegroundColor Red
+    foreach ($base in $registryBasePaths) {
+        foreach ($key in $initialRegistry[$base].Keys) {
+            Write-Host "  - $key : $($initialRegistry[$base][$key])" -ForegroundColor Red
+        }
+    }
+}
+
+$folderIssues = $false
+foreach ($folderInfo in $initialFolders.Values) {
+    if ($folderInfo.Path) {
+        $folderIssues = $true
+    }
+}
+
+if (-not $folderIssues) {
+    Write-Host "Monitored folders: None found (clean)" -ForegroundColor Green
+} else {
+    Write-Host "Monitored folders: Found" -ForegroundColor Red
+    foreach ($folderInfo in $initialFolders.Values) {
+        if ($folderInfo.Path) {
+            Write-Host "  - $($folderInfo.Path)" -ForegroundColor Red
+            foreach ($item in $folderInfo.Contents) {
+                Write-Host "      Content: $item" -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+if (-not $initialThreats -or $initialThreats.Count -eq 0) {
+    Write-Host "Defender threat history: None" -ForegroundColor Green
+} else {
+    Write-Host "Defender threat history:" -ForegroundColor Red
+    foreach ($t in $initialThreats) {
+        $status = switch ($t.ThreatStatus) {
+            1 { "Allowed" }
+            2 { "Quarantined" }
+            3 { "Removed" }
+            default { "Detected" }
+        }
+
+        $line = "  - $($t.ThreatName) | $status | $($t.DetectionTime)"
+        if ($line -match '(?i)roblox') {
+            Write-Host $line -ForegroundColor Yellow
+        } else {
+            Write-Host $line -ForegroundColor Red
+        }
+    }
+}
+
+Write-Host ""
+Write-Host "=== Detection Logs ===" -ForegroundColor Cyan
+
+$groupedLive = @()
+$psCounter = 0
+$firstTimestamp = $null
+$pendingPS = $false
+
+foreach ($line in $liveEvents) {
+    if ($line -match '^\[(.*?)\] PowerShell (command executed|script executed \(\d+ lines\))') {
+        $timestamp = $matches[1]
+        if (-not $pendingPS) {
+            $firstTimestamp = $timestamp
+            $pendingPS = $true
+            $psCounter = 1
+        } else {
+            $psCounter++
+        }
+    } else {
+        if ($pendingPS) {
+            $groupedLive += "[$firstTimestamp] PowerShell execution detected ($psCounter executions)"
+            $pendingPS = $false
+            $psCounter = 0
+            $firstTimestamp = $null
+        }
+
+        $groupedLive += $line
+    }
+}
+
+if ($pendingPS) {
+    $groupedLive += "[$firstTimestamp] PowerShell execution detected ($psCounter executions)"
+}
+
+$allDetections = $eventList + $groupedLive
+
+if ($allDetections.Count -eq 0) {
+    Write-Host "No detections." -ForegroundColor Green
+} else {
+    foreach ($evt in $allDetections) {
+        if ($evt -match '(?i)roblox') {
+            Write-Host $evt -ForegroundColor Yellow
+        }
+        elseif ($evt -match "USB inserted|USB removed") {
+            Write-Host $evt -ForegroundColor Yellow
+        }
+        elseif ($evt -match "Exclusion added|Exclusion removed|Real-time protection changed|Registry key|Folder CREATED|Folder DELETED|New item created|Defender threat|Defender action|Defender malware|Defender severe|Defender event|PowerShell history file was CLEARED|PowerShell history file was TRUNCATED|DNS match found|Process started|Suspicious EXE started|Running EXE detected in monitored path|Monitor integrity warning") {
+            Write-Host $evt -ForegroundColor Red
+        }
+        elseif ($evt -match "PowerShell (command|script|execution)") {
+            Write-Host $evt -ForegroundColor Magenta
+        }
+        elseif ($evt -match "Monitor integrity: OK") {
+            Write-Host $evt -ForegroundColor Green
+        }
+        else {
+            Write-Host $evt -ForegroundColor White
+        }
+    }
+}
+
+if (Confirm-ExitWithDelay) {
+    Stop-Process -Id $PID
+}
