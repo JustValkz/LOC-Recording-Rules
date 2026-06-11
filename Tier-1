@@ -3,6 +3,8 @@ param(
     [string]$SessionPath
 )
 
+$script:LocRecSourceUrl = 'https://raw.githubusercontent.com/JustValkz/LOC-Recording-Rules/refs/heads/main/Tier-1'
+
 function Show-LoadingBar {
     param([string]$StepName)
 
@@ -309,8 +311,37 @@ function Get-LocRecScriptCachePath {
     Join-Path $env:TEMP 'locrec_tier1_monitor.ps1'
 }
 
+function Write-LocRecScriptCacheContent {
+    param(
+        [string]$CachePath,
+        [string]$Content
+    )
+
+    if (-not $CachePath -or -not $Content) { return $false }
+
+    try {
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($CachePath, $Content, $utf8NoBom)
+        return (Test-Path -LiteralPath $CachePath -PathType Leaf)
+    } catch {
+        return $false
+    }
+}
+
 function Initialize-LocRecScriptCache {
+    param([switch]$ForceRefresh)
+
     $cachePath = Get-LocRecScriptCachePath
+
+    if (-not $ForceRefresh -and (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+        $cachedInfo = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
+        if ($cachedInfo -and $cachedInfo.Length -gt 1000) {
+            return $cachePath
+        }
+    }
+
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
     $sourceCandidates = @(
         $PSCommandPath,
         $MyInvocation.MyCommand.Path,
@@ -322,69 +353,37 @@ function Initialize-LocRecScriptCache {
         if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
 
         try {
-            Copy-Item -LiteralPath $candidate -Destination $cachePath -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
+            $content = Get-Content -LiteralPath $candidate -Raw -ErrorAction Stop
+            if (Write-LocRecScriptCacheContent -CachePath $cachePath -Content $content) {
+                return $cachePath
+            }
+        } catch {}
+    }
+
+    $downloadUrls = @($script:LocRecSourceUrl)
+
+    try {
+        $recentCommands = Get-History -Count 20 -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine }
+        foreach ($entry in ($recentCommands | Select-Object -Last 5)) {
+            if ($entry.CommandLine -match '(?i)https?://[^\s''"]+') {
+                $downloadUrls += $matches[0]
+            }
+        }
+    } catch {}
+
+    $downloadUrls = $downloadUrls | Where-Object { $_ } | Select-Object -Unique
+
+    foreach ($downloadUrl in $downloadUrls) {
+        try {
+            $content = (Invoke-WebRequest -Uri $downloadUrl -UseBasicParsing -ErrorAction Stop).Content
+            if ($content -and $content.Length -gt 1000 -and (Write-LocRecScriptCacheContent -CachePath $cachePath -Content $content)) {
                 return $cachePath
             }
         } catch {}
     }
 
     if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
-        $cachedInfo = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
-        if ($cachedInfo -and $cachedInfo.Length -gt 1000) {
-            return $cachePath
-        }
-    }
-
-    try {
-        $recentCommands = Get-History -Count 20 -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine }
-        foreach ($entry in ($recentCommands | Select-Object -Last 5)) {
-            $cmd = $entry.CommandLine
-
-            if ($cmd -match '(?i)https?://[^\s''"]+') {
-                $historyUrl = $matches[0]
-                try {
-                    Invoke-WebRequest -Uri $historyUrl -OutFile $cachePath -UseBasicParsing -ErrorAction Stop | Out-Null
-                    if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
-                        $historyInfo = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
-                        if ($historyInfo -and $historyInfo.Length -gt 1000) {
-                            return $cachePath
-                        }
-                    }
-                } catch {}
-            }
-
-            if ($cmd -match "(?i)['\`"]([^'\`"]+Tier-1)['\`"]") {
-                $historyPath = $matches[1]
-                if (Test-Path -LiteralPath $historyPath -PathType Leaf) {
-                    try {
-                        Copy-Item -LiteralPath $historyPath -Destination $cachePath -Force -ErrorAction Stop
-                        if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
-                            return $cachePath
-                        }
-                    } catch {}
-                }
-            }
-        }
-    } catch {}
-
-    $downloadUrls = @(
-        'https://raw.githubusercontent.com/reggiecarterthesecond-web/recording-policies/refs/heads/main/Tier-1',
-        'https://raw.githubusercontent.com/reggiecarterthesecond-web/recording-policies/refs/heads/main/tier-1'
-    )
-
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-
-    foreach ($downloadUrl in $downloadUrls) {
-        try {
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $cachePath -UseBasicParsing -ErrorAction Stop | Out-Null
-            if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
-                $downloadedInfo = Get-Item -LiteralPath $cachePath -ErrorAction SilentlyContinue
-                if ($downloadedInfo -and $downloadedInfo.Length -gt 1000) {
-                    return $cachePath
-                }
-            }
-        } catch {}
+        return $cachePath
     }
 
     $null
@@ -394,16 +393,35 @@ function Start-LocRecMonitorWindow {
     param([string]$SessionPath)
 
     try {
-        $monitorScript = Initialize-LocRecScriptCache
-        if (-not $monitorScript) { return }
+        $cachePath = Initialize-LocRecScriptCache -ForceRefresh
+        if (-not $cachePath) { return }
+
+        $launcherPath = Join-Path $env:TEMP 'locrec_monitor_launcher.ps1'
+        $launcherContent = @'
+param(
+    [string]$SessionPath,
+    [string]$CachePath
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+if (-not $CachePath -or -not (Test-Path -LiteralPath $CachePath -PathType Leaf)) {
+    Write-Host 'Monitor could not start.' -ForegroundColor Red
+    return
+}
+
+. $CachePath -MonitorMode -SessionPath $SessionPath
+'@
+
+        Set-Content -Path $launcherPath -Value $launcherContent -Encoding UTF8
 
         $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
         Start-Process -FilePath $psExe -ArgumentList @(
             '-NoExit',
             '-ExecutionPolicy', 'Bypass',
-            '-File', $monitorScript,
-            '-MonitorMode',
-            '-SessionPath', $SessionPath
+            '-File', $launcherPath,
+            '-SessionPath', $SessionPath,
+            '-CachePath', $cachePath
         ) -WindowStyle Normal -ErrorAction SilentlyContinue | Out-Null
     } catch {}
 }
@@ -1391,7 +1409,7 @@ if ($MonitorMode) {
     return
 }
 
-$null = Initialize-LocRecScriptCache
+$null = Initialize-LocRecScriptCache -ForceRefresh:$(-not $PSCommandPath)
 $scriptPath = Initialize-LocRecScriptCache
 if (-not $scriptPath) { $scriptPath = $PSCommandPath }
 $currentPID = $PID
@@ -1810,7 +1828,7 @@ while ($true) {
         try {
             $locRecSessionPath = Get-LocRecSessionPath
             $monitorHeartbeatPath = Join-Path $env:TEMP ("live_monitor_" + [guid]::NewGuid().ToString("N") + ".hb")
-            $cachedScriptPath = Initialize-LocRecScriptCache
+            $cachedScriptPath = Initialize-LocRecScriptCache -ForceRefresh
             if (-not $cachedScriptPath) { $cachedScriptPath = $scriptPath }
 
             Export-LocRecMonitorSession -SessionPath $locRecSessionPath -HeartbeatPath $monitorHeartbeatPath -ScriptPath $cachedScriptPath
