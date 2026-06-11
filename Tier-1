@@ -1179,8 +1179,8 @@ Write-Host "[ Step 3 of 3 - Monitoring ]" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Monitoring active." -ForegroundColor Green
 Write-Host ""
-Write-Host "Type End then press Enter only if you're done with your match." -ForegroundColor Yellow
-Write-Host "Closing the monitor will result in an immediate failure." -ForegroundColor Red
+Write-Host "Type End to show your results." -ForegroundColor Yellow
+Write-Host "Closing the monitor before end steps will result in an immediate failure." -ForegroundColor Red
 Write-Host ""
 
 while ($true) {
